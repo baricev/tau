@@ -29,7 +29,7 @@ def test_ring_buffer_wrap_once():
         num_layers=NUM_LAYERS,
         num_kv_heads=NUM_KV_HEAD,
         head_dim=HEAD_DIM,
-        dtype=jnp.int32,      # int values make inspection easy
+        dtype=jnp.bfloat16,
     )
     seg = SegmentInfo(
         lengths=jnp.zeros((BATCH,), dtype=jnp.int32),
@@ -56,10 +56,13 @@ def test_ring_buffer_wrap_once():
         seg = seg.advance(1)
 
     # 3) assertions – CI will go red on any off‑by‑one
-    ring_contents = cache.key[0, 0, :, 0, 0]            # shape (CACHE_LEN,)
+    ring_contents = cache.key[0, 0, :, 0, 0].astype(jnp.bfloat16)
+    ring_contents = ring_contents * cache.key_scale[0, 0, :, 0]
 
-    expected = jnp.asarray([5, 2, 3, 4])                # oldest (1) should be gone
-    assert jnp.array_equal(ring_contents, expected), f"{ring_contents=} {expected=}"
+    expected = jnp.asarray([5, 2, 3, 4], dtype=jnp.bfloat16)
+    assert jnp.allclose(ring_contents, expected, atol=2e-2), (
+        f"{ring_contents=} {expected=}"
+    )
 
     # sequence length is capped at CACHE_LEN after wrap
     assert int(seg.lengths[0]) == CACHE_LEN
@@ -70,4 +73,3 @@ def test_ring_buffer_wrap_once():
 
     print(f"test_ring_buffer_wrap_once passed: {ring_contents=}, {seg.lengths=}, {seg.cursor=}, {seg.offset=}")
 
-test_ring_buffer_wrap_once()
