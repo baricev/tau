@@ -160,12 +160,13 @@ def init_cache(
     # [REFACTORED] Shape for scales does not include the head_dim
     scale_shape = (num_layers, batch, max_seq_len, num_kv_heads)
 
-    # [REFACTORED] key/value are int8, scales are the original float dtype
+    # [REFACTORED] key/value are int8. Scales are always stored as bfloat16
+    # regardless of the requested dtype.
     return KVCache(
         key=jnp.zeros(cache_shape, dtype=jnp.int8),
         value=jnp.zeros(cache_shape, dtype=jnp.int8),
-        key_scale=jnp.ones(scale_shape, dtype=dtype),
-        value_scale=jnp.ones(scale_shape, dtype=dtype),
+        key_scale=jnp.ones(scale_shape, dtype=jnp.bfloat16),
+        value_scale=jnp.ones(scale_shape, dtype=jnp.bfloat16),
         sequence_lengths=jnp.zeros((batch,), dtype=jnp.int32),
         write_positions=jnp.zeros((batch,), dtype=jnp.int32),
     )
@@ -209,6 +210,7 @@ def _quantize_to_int8(x: Array) -> tuple[Array, Array]:
     """
     # Epsilon to prevent division by zero
     EPS = 1e-6
+    x = x.astype(jnp.bfloat16)
     # Calculate scale per-vector along the last dimension
     max_abs = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
     scale = max_abs / 127.0 + EPS
@@ -216,7 +218,7 @@ def _quantize_to_int8(x: Array) -> tuple[Array, Array]:
     x_q = (x / scale).round().astype(jnp.int8)
     # Squeeze the last dimension from the scale for storage
     scale = jnp.squeeze(scale, axis=-1)
-    return x_q, scale
+    return x_q, scale.astype(jnp.bfloat16)
 
 def _update_ragged(
     key_cache_layer: Array,   # (B, S, K, H)
@@ -235,6 +237,8 @@ def _update_ragged(
     # [REFACTORED] Quantize inputs before updating cache
     key_proj_q, key_proj_s = jax.vmap(_quantize_to_int8)(key_proj)
     val_proj_q, val_proj_s = jax.vmap(_quantize_to_int8)(value_proj)
+    key_proj_s = key_proj_s.astype(key_scale_layer.dtype)
+    val_proj_s = val_proj_s.astype(val_scale_layer.dtype)
 
     max_cache_len = key_cache_layer.shape[1]
     def update_one(cache_k, cache_v, cache_ks, cache_vs, new_k, new_v, new_ks, new_vs, pos):
@@ -277,6 +281,8 @@ def _update_dense(
     # [REFACTORED] Quantize the entire chunk of projections
     key_proj_q, key_proj_s = jax.vmap(_quantize_to_int8)(key_proj)
     val_proj_q, val_proj_s = jax.vmap(_quantize_to_int8)(value_proj)
+    key_proj_s = key_proj_s.astype(key_scale_layer.dtype)
+    val_proj_s = val_proj_s.astype(val_scale_layer.dtype)
 
     write_pos_B = write_pos_B.reshape(-1)
     seq_lens_B = seq_lens_B.reshape(-1)
@@ -389,20 +395,18 @@ def reset_cache_positions(cache: KVCache,
         new_pos = cache.write_positions.at[batch_indices].set(0)
     """Allocate an all‑zero KV cache."""
 
-    dtype = cache.sequence_lengths.dtype
-
     num_layers, batch, max_seq_len, num_kv_heads, head_dim = cache.key.shape
     # [REFACTORED] key/value are now int8 for memory savings
     cache_shape = (num_layers, batch, max_seq_len, num_kv_heads, head_dim)
     # [REFACTORED] Shape for scales does not include the head_dim
     scale_shape = (num_layers, batch, max_seq_len, num_kv_heads)
 
-    # [REFACTORED] key/value are int8, scales are the original float dtype
+    # [REFACTORED] key/value are int8. Scales are always stored as bfloat16.
     return KVCache(
         key=jnp.zeros(cache_shape, dtype=jnp.int8),
         value=jnp.zeros(cache_shape, dtype=jnp.int8),
-        key_scale=jnp.ones(scale_shape, dtype=dtype),
-        value_scale=jnp.ones(scale_shape, dtype=dtype),
+        key_scale=jnp.ones(scale_shape, dtype=jnp.bfloat16),
+        value_scale=jnp.ones(scale_shape, dtype=jnp.bfloat16),
         sequence_lengths=new_len,
         write_positions=new_pos,
     )
