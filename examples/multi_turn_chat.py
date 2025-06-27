@@ -114,25 +114,8 @@ except ImportError:
     pass
 
 if IN_COLAB:
-    from google.colab import drive
-    
-    # Uncommment the line below to mount the drive
-    drive.mount("/content/drive")
-
-    # Clone the gemma-jax repository if it doesn't exist
-    if not os.path.exists('gemma-jax'):
-        print("Cloning gemma-jax repository...")
-
-        # Uncommment the line below to clone the gemma-jax repository
-        # ! git clone https://github.com/baricev/gemma-jax
-
-    # Change the current working directory to the gemma-jax repository
-    os.chdir('/content/gemma-jax')
-
     print(f"Running in Google Colab. Current directory: {os.getcwd()}")
-
     root_dir = Path('/content/gemma-jax')
-
     TOKENIZER_PATH =  root_dir / 'tokenizer.model'       # Absolute path to the Gemma model checkpoint
     CHECKPOINT_PATH =  Path("/content/drive/MyDrive/4b") # Absolute path to the Gemma model checkpoint
 
@@ -155,10 +138,38 @@ print(f"Tokenizer path: {TOKENIZER_PATH}")
 print(f"Checkpoint path: {CHECKPOINT_PATH}")
 
 # %% [markdown]
+# ### Installation
 #
-# ### Running the script from a Notebook (Colab or VS Code)
+# Install required Python packages for TPU support and dataset management.
+
+# %%
+# !pip install -e . --quiet
+
+# %% 
+
+# If running in Colab, mount the drive and clone the gemma-jax repository (uncomment the lines below)
+
+# from google.colab import drive
+# drive.mount("/content/drive")
+# # Clone the gemma-jax repository if it doesn't exist
+
+# if not os.path.exists('gemma-jax'):
+#     print("Cloning gemma-jax repository...")
+
+#     ! git clone https://github.com/baricev/gemma-jax
+
+#     # Change the current working directory to the gemma-jax repository
+#     os.chdir('/content/gemma-jax')
+
+#     ! pip install -e . --quiet
+
+
+
+# %% [markdown]
+#
+# ### Running the script directly from a Notebook (Colab or VS Code)
 #  
-# See commented out lines below for example commands to run the script from a Notebook (Colab or VS Code)
+# See commented out lines below for example commands
 # %%  
 # Colab:
 # !python examples/multi_turn_chat.py --tokenizer_path /content/tau/tokenizer.model --checkpoint_path /content/drive/MyDrive/4b
@@ -166,15 +177,6 @@ print(f"Checkpoint path: {CHECKPOINT_PATH}")
 # VS Code:
 # !python multi_turn_chat.py --tokenizer_path  /Users/v/new_workspace/baricev-gemma-jax-final-june-26/tokenizer.model
 # 
-
-
-# %% [markdown]
-# ### Installation
-#
-# Install required Python packages for TPU support and dataset management.
-
-# %%
-# !pip install -e . --quiet
 
 # %% [markdown]
 # ### Model Loading
