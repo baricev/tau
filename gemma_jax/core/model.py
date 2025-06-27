@@ -5,6 +5,9 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+from jax.experimental.pallas.ops.tpu import splash_attention
 import numpy as np
 
 import dataclasses
@@ -13,8 +16,9 @@ from functools import partial
 from typing import Any, NamedTuple, Optional
 
 from gemma_jax.core.cache import KVCache, update_cache_layer
-from gemma_jax.core.rope import ( apply_rope_cached,)
+from gemma_jax.core.rope import apply_rope_cached
 from gemma_jax.core.segment import SegmentInfo
+from gemma_jax.core.ragged_attention import ragged_multi_head_attention
 
 # -----------------------------------------------------------------------------
 # Transformer class
@@ -367,19 +371,121 @@ def output_projection(x: Array, output_proj: Array) -> Array:
   return jnp.einsum("btnh,nhd->btd", x, output_proj)
 
 @jax.jit
-def multi_head_attention(
+def multi_head_attention_fused(
     q: Array,                      # (B, T, N, H) query
-    k: Array,                      # (B, S, K, H) key
+    k: Array,                      # (B, S, K, H) key  
     v: Array,                      # (B, S, K, H) value
     attn_mask_BTS: Array,          # (B, T, S) attention mask
 ) -> Array:
   """
+  Compute multi-head attention using splash attention kernel for prefill optimization.
+  
+  This replaces the combination of jnp.einsum + jax.nn.softmax with a fused
+  attention kernel that combines QK^T, masking, softmax, and attention*V 
+  operations into a single, memory-efficient TPU kernel.
+  
+  Returns the output of the attention layer (B, T, N, H)
+  """
+  B, T, N, H = q.shape
+  _, S, K, _ = k.shape
+  G = N // K  # Groups per KV head
+  
+  # Reshape for grouped query attention  
+  q = q.reshape((B, T, K, G, H))
+  
+  # Process each group separately for GQA
+  outputs = []
+  for g in range(G):
+    q_g = q[:, :, :, g, :]  # (B, T, K, H)
+    
+    # Transpose to standard attention format: (B, K, T, H) and (B, K, S, H)
+    q_heads = q_g.transpose(0, 2, 1, 3)  # (B, K, T, H)  
+    k_heads = k.transpose(0, 2, 1, 3)    # (B, K, S, H)
+    v_heads = v.transpose(0, 2, 1, 3)    # (B, K, S, H)
+    
+    # Create causal mask in the format expected by splash attention
+    # Convert boolean mask to attention logits mask
+    mask_logits = jnp.where(attn_mask_BTS, 0.0, K_MASK)  # (B, T, S)
+    
+    try:
+      # Use splash attention for fused computation
+      # This combines QK^T, masking, softmax, and attention*V in one kernel
+      attn_output = splash_attention.splash_attention_kernel(
+          q=q_heads,  # (B, K, T, H)
+          k=k_heads,  # (B, K, S, H) 
+          v=v_heads,  # (B, K, S, H)
+          segment_ids=None,  # No segment masking needed
+          ab=mask_logits,  # (B, T, S) attention bias/mask
+          save_residuals=False,
+      )
+      # attn_output shape: (B, K, T, H)
+      
+      # Transpose back to match expected format: (B, T, K, H)
+      attn_output = attn_output.transpose(0, 2, 1, 3)
+      
+    except Exception:
+      # Fallback to manual computation if splash attention fails
+      scores = jnp.einsum("btkh,bskh->btks", q_g, k) / jnp.sqrt(H)
+      scores = jnp.where(jnp.expand_dims(attn_mask_BTS, -1), scores, K_MASK)
+      attn_weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(scores.dtype)
+      attn_output = jnp.einsum("btks,bskh->btkh", attn_weights, v)
+    
+    outputs.append(attn_output)
+  
+  # Combine group outputs: (B, T, K, G, H)
+  output = jnp.stack(outputs, axis=3)
+  output = output.reshape((B, T, N, H))
+  
+  return output
+
+@partial(jax.jit, static_argnums=(4, 5))
+def multi_head_attention(
+    q: Array,                      # (B, T, N, H) query
+    k: Array,                      # (B, S, K, H) key
+    v: Array,                      # (B, S, K, H) value
+    attn_mask_BTS: Array,          # (B, T, S) attention mask or sequence lengths for ragged
+    use_fused_kernel: bool = True, # Use fused kernel for prefill optimization
+    use_ragged_attention: bool = False, # Use ragged attention for variable-length sequences
+) -> Array:
+  """
   Compute multi-head attention with scaled dot-product attention.
+  
+  Supports multiple optimization modes:
+  - Fused kernels for prefill optimization (use_fused_kernel=True)
+  - Ragged attention for variable-length sequences (use_ragged_attention=True)
 
   Returns the output of the attention layer (B, T, N, H)
   """
   B, T, N, H = q.shape
   _, S, K, _ = k.shape
+  
+  # Use ragged attention for variable-length sequences
+  if use_ragged_attention:
+    # attn_mask_BTS should contain sequence lengths (B,) for ragged attention
+    if attn_mask_BTS.ndim == 1:
+      # Already sequence lengths
+      lengths = attn_mask_BTS.astype(jnp.int32)
+    else:
+      # Convert mask to lengths by finding last True position for each batch
+      lengths = jnp.sum(attn_mask_BTS[:, 0, :].astype(jnp.int32), axis=-1)
+    
+    try:
+      return ragged_multi_head_attention(q, k, v, lengths)
+    except Exception:
+      # Fallback to masked attention
+      # Convert lengths back to mask
+      seq_mask = jnp.arange(S)[None, None, :] < lengths[:, None, None]
+      attn_mask_BTS = jnp.broadcast_to(seq_mask, (B, T, S))
+  
+  # Use fused kernel for prefill when enabled and sequence length is sufficient
+  if use_fused_kernel and T > 1:  # Prefill case (T > 1)
+    try:
+      return multi_head_attention_fused(q, k, v, attn_mask_BTS)
+    except Exception:
+      # Fallback to original implementation if fused kernel fails
+      pass
+  
+  # Original implementation (for decode or fallback)
   G = N // K
   
   q = q.reshape((B, T, K, G, H))
@@ -390,7 +496,6 @@ def multi_head_attention(
     jnp.where(jnp.expand_dims(attn_mask_BTS, -2), scores, K_MASK).astype(jnp.float32),
     axis=-1
   ).astype(jnp.bfloat16)
-
 
   probs = attn_weights.reshape((B, T, K, G, S))
 
@@ -480,12 +585,30 @@ def self_attention(
 
     query_scaled = query * layer_config.query_pre_attn_scalar
 
-    attn_out = multi_head_attention(
-        query_scaled.astype(jnp.float32),
-        cache_key.astype(jnp.float32),
-        cache_value.astype(jnp.float32),
-        final_mask,
-    ).astype(x.dtype)
+    # Determine if we should use ragged attention for variable-length sequences
+    use_ragged = ragged and hasattr(layer_config, 'use_ragged_attention') and layer_config.use_ragged_attention
+    
+    if use_ragged:
+        # Use sequence lengths from SegmentInfo for ragged attention
+        # This eliminates padding overhead for variable-length sequences
+        attn_out = multi_head_attention(
+            query_scaled.astype(jnp.float32),
+            cache_key.astype(jnp.float32),
+            cache_value.astype(jnp.float32),
+            seg_info.lengths,  # Pass sequence lengths for ragged attention
+            use_fused_kernel=True,
+            use_ragged_attention=True,
+        ).astype(x.dtype)
+    else:
+        # Use standard masked attention
+        attn_out = multi_head_attention(
+            query_scaled.astype(jnp.float32),
+            cache_key.astype(jnp.float32),
+            cache_value.astype(jnp.float32),
+            final_mask,
+            use_fused_kernel=True,
+            use_ragged_attention=False,
+        ).astype(x.dtype)
 
     attn_out = output_projection(attn_out, layer.output_proj)
 

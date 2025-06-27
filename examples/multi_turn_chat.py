@@ -290,7 +290,7 @@ model, tokenizer, rope_cache, cache, config = make_model_objects(
     dtype_str=dtype_str,
     batch_size=batch,
     generate_steps=generate_steps,
-    shard_model=True,  # Set to False for debugging or single-device inference
+    shard_model=shard_model,  # Set to False for debugging or single-device inference
 )
 
 # Dummy state for the model, can be used to store additional parameters or state
