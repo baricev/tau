@@ -1,4 +1,3 @@
-# multi_turn_chat.py
 # %% [markdown]
 # ## Gemma JAX: Multi-Turn Batched Inference Notebook
 #
@@ -11,70 +10,14 @@
 
 # %%
 
-try:
-  import google.colab
-
-  IN_COLAB = True
-except ImportError:
-  IN_COLAB = False
-
-if IN_COLAB:
-  from google.colab import drive
-
-  drive.mount("/content/drive")
-
-  import os
-
-  os.chdir("/content/drive/My Drive/gemma-jax")
-  print(f"Running in Google Colab. Current directory: {os.getcwd()}")
-else:
-  import os
-  from pathlib import Path
-
-  home_dir = Path.home()
-  os.chdir(home_dir / "docs" / "gemma-jax-opus")
-  print(f"Running locally. Current directory: {Path.cwd()}")
-
-# %% [markdown]
-# ### Installation
-#
-# Install required Python packages for TPU support and dataset management. The command below quietly installs dependencies suitable for TPU-based inference.
-
-# %%
-# !pip install -e . --quiet
-
-# %% [markdown]
-# ### Configuration Defaults
-#
-# Set the default paths and parameters. Adjust the paths to reflect your actual filesystem setup for the tokenizer and model checkpoints.
-
-# %%
-from pathlib import Path
-
-root_dir = Path.cwd()
-checkpoint_path = root_dir / "4b"  # Absolute path to the Gemma model checkpoint
-tokenizer_path = root_dir / "tokenizer.model"  # Absolute path to SentencePiece tokenizer
-
-assert tokenizer_path.exists(), f"Tokenizer path {tokenizer_path} does not exist."
-assert checkpoint_path.exists(), f"Checkpoint path {checkpoint_path} does not exist."
-
-print(f"Root directory: {root_dir}")
-print(f"Tokenizer path: {tokenizer_path}")
-print(f"Checkpoint path: {checkpoint_path}")
-
-# %% [markdown]
-# ### Core Package Imports
-#
-# Import essential components from gemma-jax required for model configuration, loading, inference, and text processing.
-
-# %%
-
 import queue
 import threading
 
 import time
 from functools import partial
 import math
+from pathlib import Path
+import os
 from typing import Any
 
 import numpy as np
@@ -82,33 +25,232 @@ import jax
 from jax import numpy as jnp
 from jax import Array
 
-try:
-    from gemma_jax.core.weights import create_config  as original_create_gemma3_config
-    from gemma_jax.core.weights import create_device_mesh, load_model, load_unsharded_model
-
-except ImportError:
-    # Fallback for older versions of gemma_jax
-    from gemma_jax.core.weights import create_config as original_create_gemma3_config
-    from gemma_jax.core.weights import  create_device_mesh, load_model
-
-from gemma_jax.core.rope import load_rope_cache
+from gemma_jax.core.weights import create_config  as original_create_gemma3_config
+from gemma_jax.core.weights import create_device_mesh, load_model, load_unsharded_model
+from gemma_jax.core.rope import init_rope_cache, load_rope_cache
 from gemma_jax.core.sp_tokenizer import SentencePieceTokenizer, encode_raw_ids, process_and_pad_inputs, encode_text, decode_tokens, format_prompt
 from gemma_jax.core.inference import greedy_sample
 
 # from gemma_jax.core.chunked_prefill import _scatter_token, _gather_token
 
 from gemma_jax.core.cache import init_cache, create_cache_partition_spec, shard_kvcache_with_tree_map, KVCache
-from gemma_jax.core.model import forward_fn, decode # , build_gen_step_attn_masks
+from gemma_jax.core.model import forward_fn, decode
+from gemma_jax.core.segment import SegmentInfo
 
-from gemma_jax.core.segment import SegmentInfo            #  NEW
+from jax.experimental.pallas.ops.tpu import flash_attention, splash_attention
 
 PAD_ID, EOS_ID, BOS_ID, END_OF_TURN_ID = 0, 1, 2, 106
+
+def in_notebook():
+    """Check if running in a Jupyter notebook (including VS Code)."""
+    try:
+        # Check if IPython is available and we're in an interactive shell
+        from IPython import get_ipython
+        if get_ipython() is not None:
+            # Check if it's a notebook kernel (ZMQ) vs terminal IPython
+            return get_ipython().__class__.__name__ == 'ZMQInteractiveShell'
+    except ImportError:
+        pass
+    return False
+
+def in_colab():
+    try:
+        import google.colab
+        return True
+    except ImportError:
+        return False
+
+def get_repo_root():
+    """Get the root directory of the gemma-jax repository."""
+    from pathlib import Path
+    try:
+      return Path(__file__).parent.parent
+    except NameError:
+      return Path.cwd()
+
+def maybe_get_paths_from_args(default_checkpoint_path: Path, default_tokenizer_path: Path):
+    """Get the paths from the command line arguments."""
+    import argparse
+    try:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--checkpoint_path", type=str, default=None)
+        parser.add_argument("--tokenizer_path", type=str, default=None)
+        args = parser.parse_args()
+
+        checkpoint_path = args.checkpoint_path
+        tokenizer_path = args.tokenizer_path
+
+        if checkpoint_path is not None and checkpoint_path != "":
+            checkpoint_path = Path(checkpoint_path)
+        else:
+            checkpoint_path = default_checkpoint_path
+
+        if tokenizer_path is not None and tokenizer_path != "":
+            tokenizer_path = Path(tokenizer_path)
+        else:
+            tokenizer_path = default_tokenizer_path
+
+        return checkpoint_path, tokenizer_path
+    except:
+        return default_checkpoint_path, default_tokenizer_path
+
+# %% [markdown]
+# ### Configuration Defaults
+#
+# Set the default paths and parameters. Adjust the paths to reflect your actual filesystem setup for the tokenizer and model checkpoints.
+
+# %%
+TOKENIZER_PATH = get_repo_root() / "tokenizer.model"
+CHECKPOINT_PATH = get_repo_root() / "4b"
+
+IN_NOTEBOOK = in_notebook()
+IN_SCRIPT = not IN_NOTEBOOK
+IN_COLAB = False
+
+try:
+  import google.colab
+  IN_COLAB = True
+except ImportError:
+    pass
+
+if IN_COLAB:
+    from google.colab import drive
+    
+    # Uncommment the line below to mount the drive
+    # drive.mount("/content/drive")
+
+    # Clone the gemma-jax repository if it doesn't exist
+    if not os.path.exists('gemma-jax'):
+        print("Cloning gemma-jax repository...")
+
+        # Uncommment the line below to clone the gemma-jax repository
+        # ! git clone https://github.com/baricev/gemma-jax
+
+    # Change the current working directory to the gemma-jax repository
+    os.chdir('/content/gemma-jax')
+
+    print(f"Running in Google Colab. Current directory: {os.getcwd()}")
+
+    root_dir = Path('/content/gemma-jax')
+
+    TOKENIZER_PATH =  root_dir / 'tokenizer.model'       # Absolute path to the Gemma model checkpoint
+    CHECKPOINT_PATH =  Path("/content/drive/MyDrive/4b") # Absolute path to the Gemma model checkpoint
+
+if IN_SCRIPT:
+    try:
+        print("Getting paths from args...")
+        CHECKPOINT_PATH, TOKENIZER_PATH = maybe_get_paths_from_args(CHECKPOINT_PATH, TOKENIZER_PATH)
+    except:
+        pass
+
+# Assert paths exist
+assert TOKENIZER_PATH.exists(), f"Tokenizer path {TOKENIZER_PATH} does not exist."
+assert CHECKPOINT_PATH.exists(), f"Checkpoint path {CHECKPOINT_PATH} does not exist."
+
+# Assert paths are absolute
+assert TOKENIZER_PATH.is_absolute(), f"Tokenizer path {TOKENIZER_PATH} is not absolute."
+assert CHECKPOINT_PATH.is_absolute(), f"Checkpoint path {CHECKPOINT_PATH} is not absolute."
+
+print(f"Tokenizer path: {TOKENIZER_PATH}")
+print(f"Checkpoint path: {CHECKPOINT_PATH}")
+
+# %% [markdown]
+#
+# ### Running the script from a Notebook (Colab or VS Code)
+#  
+# See commented out lines below for example commands to run the script from a Notebook (Colab or VS Code)
+# %%  
+# Colab:
+# !python examples/multi_turn_chat.py --tokenizer_path /content/tau/tokenizer.model --checkpoint_path /content/drive/MyDrive/4b
+# 
+# VS Code:
+# !python multi_turn_chat.py --tokenizer_path  /Users/v/new_workspace/baricev-gemma-jax-final-june-26/tokenizer.model
+# 
+
+
+# %% [markdown]
+# ### Installation
+#
+# Install required Python packages for TPU support and dataset management.
+
+# %%
+# !pip install -e . --quiet
+
+# %% [markdown]
+# ### Model Loading
+#
+# Load the model and tokenizer.
+# %%
+
+def make_model_objects(
+    checkpoint_path: Path,
+    tokenizer_path: Path,
+    model_size: int = 4,
+    cache_length: int = 1024,
+    chunk_length: int = 128,
+    window_size: int = 1024,
+    dtype_str: str = "bfloat16",
+    batch_size: int = 2,
+    generate_steps: int = 8,
+    shard_model: bool = True,
+):
+    """
+    Build the mesh, load weights, create caches, etc.  Matches the notebook.
+    """
+
+    mesh = create_device_mesh()
+    config = original_create_gemma3_config(
+        model_size=model_size,
+        batch_size=batch_size,
+        cache_length=cache_length,
+        chunk_length=chunk_length,
+        window_size=window_size,
+        generate_steps=generate_steps,  # we override later
+    )
+
+    kv_cache = init_cache(
+        batch=batch_size,
+        max_seq_len=cache_length,
+        num_layers=config.num_layers,
+        num_kv_heads=config.num_kv_heads,
+        head_dim=config.head_dim,
+    )
+    mesh_axes = {"batch": "data", "heads": "model"}
+
+    model_dtype = {
+        "bfloat16": jnp.bfloat16,
+        "float16": jnp.float16,
+        "float32": jnp.float32,
+    }[dtype_str]
+
+    if shard_model:
+        model = load_model(checkpoint_path, mesh, config, dtype=model_dtype)
+        rope_cache = load_rope_cache(mesh, config)
+        kv_cache = shard_kvcache_with_tree_map(kv_cache, mesh, mesh_axes)
+
+    else:
+        # Load the model without sharding, useful for single-device inference
+        # or debugging purposes.
+        print("Loading unsharded model...")
+        model = load_unsharded_model(checkpoint_path, config, dtype=model_dtype)
+        rope_cache = init_rope_cache(config)
+
+
+    tokenizer = SentencePieceTokenizer(tokenizer_path)
+
+    return model, tokenizer, rope_cache, kv_cache, config
+
+
+
 # %% [markdown]
 # ### Model Configuration
 #
 # Define model hyperparameters and inference settings, such as cache size, sequence lengths, batch size, and data types. Adjust these according to your computational resources and experimental needs.
 
 # %%
+
+start_setup = time.time()
+
 model_size = 4  # Model scale (e.g., 4 for 4B parameters)
 cache_length = 4096  # Length of KV-cache
 chunk_length = 1024  # Maximum input sequence length
@@ -117,59 +259,47 @@ batch = 4  # Batch size for inference
 dtype_str = "bfloat16"  # Model precision: ['bfloat16', 'float16', 'float32']
 generate_steps = 1024  # Number of tokens generated after prefill
 
-model_dtype = {"bfloat16": jnp.bfloat16, "float16": jnp.float16, "float32": jnp.float32}[dtype_str]
-
 # XLA # TODO: if needed, update mem_fraction
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.00"
-
 
 # %% [markdown]
 # ### Initialization and Model Loading
 #
-# This step includes initializing the device mesh, loading the Gemma model checkpoint, creating RoPE caches, initializing KV caches, and loading the tokenizer. It dynamically adjusts settings based on the detected hardware (CPU or TPU).
-
-# %%
-start_setup = time.time()
+# This step includes initializing the device mesh, loading the Gemma model checkpoint, creating RoPE caches, initializing KV caches, and loading the tokenizer. 
+# It dynamically adjusts settings based on the detected hardware (CPU or TPU).
 
 if jax.devices()[0].device_kind == "cpu":
   print("Using CPU device settings.")
   cache_length, chunk_length, window_size,  batch, generate_steps = 128, 128, 128, 2, 8
-  cache_length, chunk_length, window_size,  batch, generate_steps = 1*1024, 128, 1024, 2, 8 
+  cache_length, chunk_length, window_size,  batch, generate_steps = 1*1024, 128, 1024, 4, 32 
+  shard_model = False # True for TPU, False for CPU
   # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1"
+else:
+  print("Using TPU device settings.")
+  shard_model = True # True for TPU, False for CPU
 
-mesh = create_device_mesh()  # Adjust the mesh shape based on the number of devices and TPU arch
-
-config = original_create_gemma3_config(
+model, tokenizer, rope_cache, cache, config = make_model_objects(
+    checkpoint_path=CHECKPOINT_PATH,
+    tokenizer_path=TOKENIZER_PATH,
     model_size=model_size,
-    batch_size= batch,
     cache_length=cache_length,
     chunk_length=chunk_length,
     window_size=window_size,
+    dtype_str=dtype_str,
+    batch_size=batch,
     generate_steps=generate_steps,
-    # use_rope_cache=True,
+    shard_model=True,  # Set to False for debugging or single-device inference
 )
+
+# Dummy state for the model, can be used to store additional parameters or state
+state = (jnp.array([42]))
+
+print(f"Model {model_size}B loaded in {time.time() - start_setup:.2f}s")
 #%%
 # Print the configuration for verification
 print(f"{model_size}B model configuration:")
 print(f"{cache_length=}, {chunk_length=}, {window_size=}, {batch=}, {generate_steps=}")
-
-rope_cache = load_rope_cache(mesh, config) # or None if computing RoPE on the fly
-cache = init_cache(batch= batch, max_seq_len=cache_length, num_layers=config.num_layers, num_kv_heads=config.num_kv_heads, head_dim=config.head_dim)
-
-# Shard the cache using the mesh and mesh_axes:
-mesh_axes = {'batch': 'data', 'heads': 'model'}
-cache = shard_kvcache_with_tree_map(cache, mesh, mesh_axes)
-tokenizer = SentencePieceTokenizer(tokenizer_path)
-
-if "model" not in globals():
-    model = load_unsharded_model(checkpoint_path, config, dtype=model_dtype)
-    print(f"Setup completed in {time.time() - start_setup:.2f}s")
-
 print(config)
-# %%
-
-# Dummy state for the model, can be used to store additional parameters or state
-state = (jnp.array([42]))
 
 
 # %%
