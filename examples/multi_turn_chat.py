@@ -117,7 +117,7 @@ if IN_COLAB:
     from google.colab import drive
     
     # Uncommment the line below to mount the drive
-    # drive.mount("/content/drive")
+    drive.mount("/content/drive")
 
     # Clone the gemma-jax repository if it doesn't exist
     if not os.path.exists('gemma-jax'):
