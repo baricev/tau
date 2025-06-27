@@ -18,6 +18,7 @@ from typing import Any, NamedTuple, Optional
 from gemma_jax.core.cache import KVCache, update_cache_layer
 from gemma_jax.core.rope import apply_rope_cached
 from gemma_jax.core.segment import SegmentInfo
+from gemma_jax.core.ragged_attention import ragged_multi_head_attention
 
 # -----------------------------------------------------------------------------
 # Transformer class
@@ -437,23 +438,44 @@ def multi_head_attention_fused(
   
   return output
 
-@partial(jax.jit, static_argnums=(4,))
+@partial(jax.jit, static_argnums=(4, 5))
 def multi_head_attention(
     q: Array,                      # (B, T, N, H) query
     k: Array,                      # (B, S, K, H) key
     v: Array,                      # (B, S, K, H) value
-    attn_mask_BTS: Array,          # (B, T, S) attention mask
+    attn_mask_BTS: Array,          # (B, T, S) attention mask or sequence lengths for ragged
     use_fused_kernel: bool = True, # Use fused kernel for prefill optimization
+    use_ragged_attention: bool = False, # Use ragged attention for variable-length sequences
 ) -> Array:
   """
   Compute multi-head attention with scaled dot-product attention.
   
-  Uses fused Pallas kernel for prefill optimization when use_fused_kernel=True.
+  Supports multiple optimization modes:
+  - Fused kernels for prefill optimization (use_fused_kernel=True)
+  - Ragged attention for variable-length sequences (use_ragged_attention=True)
 
   Returns the output of the attention layer (B, T, N, H)
   """
   B, T, N, H = q.shape
   _, S, K, _ = k.shape
+  
+  # Use ragged attention for variable-length sequences
+  if use_ragged_attention:
+    # attn_mask_BTS should contain sequence lengths (B,) for ragged attention
+    if attn_mask_BTS.ndim == 1:
+      # Already sequence lengths
+      lengths = attn_mask_BTS.astype(jnp.int32)
+    else:
+      # Convert mask to lengths by finding last True position for each batch
+      lengths = jnp.sum(attn_mask_BTS[:, 0, :].astype(jnp.int32), axis=-1)
+    
+    try:
+      return ragged_multi_head_attention(q, k, v, lengths)
+    except Exception:
+      # Fallback to masked attention
+      # Convert lengths back to mask
+      seq_mask = jnp.arange(S)[None, None, :] < lengths[:, None, None]
+      attn_mask_BTS = jnp.broadcast_to(seq_mask, (B, T, S))
   
   # Use fused kernel for prefill when enabled and sequence length is sufficient
   if use_fused_kernel and T > 1:  # Prefill case (T > 1)
@@ -563,12 +585,30 @@ def self_attention(
 
     query_scaled = query * layer_config.query_pre_attn_scalar
 
-    attn_out = multi_head_attention(
-        query_scaled.astype(jnp.float32),
-        cache_key.astype(jnp.float32),
-        cache_value.astype(jnp.float32),
-        final_mask,
-    ).astype(x.dtype)
+    # Determine if we should use ragged attention for variable-length sequences
+    use_ragged = ragged and hasattr(layer_config, 'use_ragged_attention') and layer_config.use_ragged_attention
+    
+    if use_ragged:
+        # Use sequence lengths from SegmentInfo for ragged attention
+        # This eliminates padding overhead for variable-length sequences
+        attn_out = multi_head_attention(
+            query_scaled.astype(jnp.float32),
+            cache_key.astype(jnp.float32),
+            cache_value.astype(jnp.float32),
+            seg_info.lengths,  # Pass sequence lengths for ragged attention
+            use_fused_kernel=True,
+            use_ragged_attention=True,
+        ).astype(x.dtype)
+    else:
+        # Use standard masked attention
+        attn_out = multi_head_attention(
+            query_scaled.astype(jnp.float32),
+            cache_key.astype(jnp.float32),
+            cache_value.astype(jnp.float32),
+            final_mask,
+            use_fused_kernel=True,
+            use_ragged_attention=False,
+        ).astype(x.dtype)
 
     attn_out = output_projection(attn_out, layer.output_proj)
 
