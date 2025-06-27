@@ -27,5 +27,6 @@ dependencies = [
       "jax",
       "datasets",
       "orbax",
-      "sentencepiece"
+      "sentencepiece",
+      "pytest"
 ]
