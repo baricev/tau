@@ -14,6 +14,7 @@ from typing import Any, NamedTuple, Optional
 
 from gemma_jax.core.cache import KVCache, update_cache_layer
 from gemma_jax.core.rope import ( apply_rope_cached,)
+from gemma_jax.core.flash_attention import multi_head_flash_attention
 from gemma_jax.core.segment import SegmentInfo
 
 # -----------------------------------------------------------------------------
@@ -143,6 +144,7 @@ class AttentionConfig:
     window_size: int = 0 #  | None = None
     cache_length: int = 1024
     use_ragged_attention: bool = True
+    use_flash_attention: bool = False
     mesh: Optional[Mesh] = None  # Add mesh to config
 
 def _layer_config(config: Any, attn_type:  AttentionType, mesh: Optional[Mesh] = None) -> AttentionConfig:
@@ -169,6 +171,7 @@ def _layer_config(config: Any, attn_type:  AttentionType, mesh: Optional[Mesh] =
         ),
         cache_length=config.cache_length,
         use_ragged_attention=getattr(config, 'use_ragged_attention', True),
+        use_flash_attention=getattr(config, 'use_flash_attention', False),
         mesh=mesh,
     )
 
@@ -480,12 +483,20 @@ def self_attention(
 
     query_scaled = query * layer_config.query_pre_attn_scalar
 
-    attn_out = multi_head_attention(
-        query_scaled.astype(jnp.float32),
-        cache_key.astype(jnp.float32),
-        cache_value.astype(jnp.float32),
-        final_mask,
-    ).astype(x.dtype)
+    if layer_config.use_flash_attention and jax.default_backend() == "tpu":
+        attn_out = multi_head_flash_attention(
+            query_scaled.astype(jnp.float32),
+            cache_key.astype(jnp.float32),
+            cache_value.astype(jnp.float32),
+            final_mask,
+        ).astype(x.dtype)
+    else:
+        attn_out = multi_head_attention(
+            query_scaled.astype(jnp.float32),
+            cache_key.astype(jnp.float32),
+            cache_value.astype(jnp.float32),
+            final_mask,
+        ).astype(x.dtype)
 
     attn_out = output_projection(attn_out, layer.output_proj)
 
