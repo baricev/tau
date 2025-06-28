@@ -8,12 +8,16 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from typing import Any
+
+# Type alias for CostEstimate which may not exist in older JAX versions
+CostEstimateT = getattr(pl, "CostEstimate", Any)
 
 # Use same mask value as Gemma JAX model.py
 DEFAULT_MASK_VALUE = -2.3819763e38
 
 
-def get_gqa_cost_estimate(shape_dtype):
+def get_gqa_cost_estimate(shape_dtype) -> CostEstimateT | None:
     """Get cost estimate for GQA based on static shape information."""
     batch_size, _, num_heads, head_dim = shape_dtype[0].shape
     seq_len = shape_dtype[1].shape[1]
@@ -25,11 +29,13 @@ def get_gqa_cost_estimate(shape_dtype):
         2 * head_dim    # V multiplication
     )
 
-    return pl.CostEstimate(
-        flops=flops,
-        transcendentals=batch_size * num_heads * seq_len,
-        bytes_accessed=int(sum(np.prod(s.shape) * s.dtype.itemsize for s in shape_dtype)),
-    )
+    if hasattr(pl, "CostEstimate"):
+        return pl.CostEstimate(
+            flops=flops,
+            transcendentals=batch_size * num_heads * seq_len,
+            bytes_accessed=int(sum(np.prod(s.shape) * s.dtype.itemsize for s in shape_dtype)),
+        )
+    return None
 
 
 @functools.partial(jax.jit, static_argnames=["mask_value"])
@@ -148,7 +154,7 @@ def ragged_mqa_kernel(
     *,
     block_size: int = 256,
     mask_value: float = DEFAULT_MASK_VALUE,
-    cost_estimate: pl.CostEstimate | None = None,
+    cost_estimate: CostEstimateT | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Multi-query attention with ragged sequences using Pallas kernel."""
     batch_size, num_heads, head_dim = query.shape
