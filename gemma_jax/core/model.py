@@ -7,7 +7,7 @@ from jax import Array
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from jax.experimental.pallas.ops.tpu import splash_attention
+from jax.experimental.pallas.ops.tpu import splash_attention, flash_attention
 import numpy as np
 
 import dataclasses

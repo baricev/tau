@@ -36,7 +36,7 @@ def test_fused_attention():
         print(f"Original output stats: mean={float(output_orig.mean()):.6f}, std={float(output_orig.std()):.6f}")
     except Exception as e:
         print(f"Original implementation failed: {e}")
-        return False
+        assert False
 
     # Test fused implementation
     print("\nTesting fused implementation...")
@@ -55,17 +55,13 @@ def test_fused_attention():
         print(f"Mean difference: {float(mean_diff):.6f}")
 
         # Check if results are reasonably close (allowing for numerical differences)
-        if max_diff < 1e-2 and mean_diff < 1e-3:
-            print("✅ Fused attention test PASSED - outputs are similar")
-            return True
-        else:
-            print("❌ Fused attention test FAILED - outputs differ significantly")
-            return False
+        assert max_diff < 1e-2 and mean_diff < 1e-3
+        print("✅ Fused attention test PASSED - outputs are similar")
 
     except Exception as e:
         print(f"Fused implementation failed: {e}")
         print("This is expected if splash attention is not available")
-        return True  # Still pass since fallback should work
+        assert True
 
 def test_decode_case():
     """Test decode case (T=1) uses original implementation."""
@@ -88,10 +84,10 @@ def test_decode_case():
         output = multi_head_attention(q, k, v, attn_mask_BTS, use_fused_kernel=True)
         print(f"Decode output shape: {output.shape}")
         print("✅ Decode case test PASSED")
-        return True
+        assert True
     except Exception as e:
         print(f"Decode case failed: {e}")
-        return False
+        assert False
 
 if __name__ == "__main__":
     print("=" * 60)
