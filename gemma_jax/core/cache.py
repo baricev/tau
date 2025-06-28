@@ -354,10 +354,8 @@ def update_cache_layer(
         )
 
     # ---- bookkeeping (legacy fields) -------------------------------------
-    new_seq_len = jnp.maximum(cache.sequence_lengths,
-                              write_pos_B + seq_lens_B)
-    new_seq_len = jnp.minimum(new_seq_len, cache.cache_len)
-    new_write_pos = (cache.write_positions + seq_lens_B) % cache.cache_len
+    new_seq_len = jnp.minimum(seg_info.lengths + seq_lens_B, cache.cache_len)
+    new_write_pos = (seg_info.cursor + seq_lens_B) % cache.cache_len
 
     # [REFACTORED] Construct the new cache with all updated fields
     new_cache = KVCache(
