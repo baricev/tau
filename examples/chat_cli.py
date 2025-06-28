@@ -160,7 +160,7 @@ def _gen_one(carry, *, model, rope, cfg, mesh):
     x, kv2 = forward_fn(
         state,
         cur_tok[:, None],                  # (B,1)
-        seg_info.current_pos[:, None],     # (B,1)
+        seg_info.next_pos[:, None],        # (B,1)
         # attn,
         seg_info,
         model=model,

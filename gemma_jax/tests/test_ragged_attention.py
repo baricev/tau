@@ -159,6 +159,49 @@ def test_padding_elimination_benefit():
         assert False
 
 
+def test_generation_token_attends_to_self():
+    """New token in ragged mode should attend to itself."""
+    B, T, N, H = 1, 1, 2, 8
+    S = 2
+    K = 2
+
+    key = jax.random.PRNGKey(0)
+    k1, k2, k3 = jax.random.split(key, 3)
+
+    q = jax.random.normal(k1, (B, T, N, H), dtype=jnp.bfloat16)
+    k = jax.random.normal(k2, (B, S, K, H), dtype=jnp.bfloat16)
+    v = jax.random.normal(k3, (B, S, K, H), dtype=jnp.bfloat16)
+
+    lengths_before = jnp.array([1], dtype=jnp.int32)
+    lengths_after = jnp.array([2], dtype=jnp.int32)
+
+    mask_full = jnp.array([[[True, True]]], dtype=bool)
+
+    out_masked = multi_head_attention(
+        q, k, v, mask_full,
+        use_fused_kernel=False,
+        use_ragged_attention=False,
+    )
+
+    try:
+        out_bad = multi_head_attention(
+            q, k, v, lengths_before,
+            use_fused_kernel=False,
+            use_ragged_attention=True,
+        )
+
+        out_good = multi_head_attention(
+            q, k, v, lengths_after,
+            use_fused_kernel=False,
+            use_ragged_attention=True,
+        )
+
+        assert jnp.max(jnp.abs(out_good - out_masked)) < 1e-3
+        assert jnp.max(jnp.abs(out_bad - out_masked)) > 1e-3
+    except Exception:
+        pytest.skip("Ragged kernels unavailable on this backend")
+
+
 def test_different_sequence_lengths():
     """Test ragged attention with various sequence length patterns."""
     print("\n" + "="*60)
