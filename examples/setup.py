@@ -487,7 +487,7 @@ def _generate_one_step(
     x_emb, updated_kv_cache = forward_fn(
         model_state,
         cur_tok[:, None],
-        seg_info.current_pos[:, None],
+        seg_info.next_pos[:, None],
         # attn_mask,
         seg_info,                         #  NEW
         model=model,
