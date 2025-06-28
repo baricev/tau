@@ -18,7 +18,6 @@ from typing import Any, NamedTuple, Optional
 from gemma_jax.core.cache import KVCache, update_cache_layer
 from gemma_jax.core.rope import apply_rope_cached
 from gemma_jax.core.segment import SegmentInfo
-from gemma_jax.core.ragged_attention import ragged_multi_head_attention
 
 # -----------------------------------------------------------------------------
 # Transformer class
@@ -181,24 +180,6 @@ def _layer_config(config: Any, attn_type:  AttentionType, mesh: Optional[Mesh] =
 # Attention helpers
 # -----------------------------------------------------------------------------
 
-def _new_apply_rope(x: Array, pos: Array, *, base: int, scale: float) -> Array:
-  H = x.shape[-1]
-  half = H // 2
-  freq = base ** (jnp.arange(half) * 2 / H)
-  theta = pos[..., None] / freq / scale
-  sin, cos = jnp.sin(theta), jnp.cos(theta)
-  sin, cos = sin[..., None, :], cos[..., None, :]
-  x1, x2 = jnp.split(x, 2, axis=-1)
-  return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
-
-
-@partial(jax.jit, static_argnames=("window",))
-def _extract_window(mat: Array, end_idx: Array, *, window: int) -> Array:
-  def _one(m, e):
-    start = jnp.maximum(e - window, 0)
-    return jax.lax.dynamic_slice_in_dim(m, start, window, axis=0)
-  return jax.vmap(_one)(mat, end_idx)
-
 def is_tpu_available() -> bool:
     try:
         return jax.devices()[0].platform == 'tpu'
@@ -208,114 +189,40 @@ def is_tpu_available() -> bool:
 def mask_to_lengths(mask: Array) -> Array:
     return jnp.sum(mask.astype(jnp.int32), axis=-1)
 
-# -----------------------------------------------------------------------------
-# Attention masks (keeping for backward compatibility, but may be redundant)
-# -----------------------------------------------------------------------------
-
-# def _create_sliding_mask(
-#     segment_pos: jnp.ndarray,
-#     end_index: int,
-#     cache_len: int,
-#     sliding_window_size: int,
-# ) -> jax.Array:
-#   """Mask for sliding window attention."""
-#   total_tokens = end_index + segment_pos.shape[1]
-
-#   def _reconstruct_rotated_cache_positions():
-#     cache_positions = jnp.arange(cache_len) + total_tokens - cache_len
-#     cache_positions = (
-#         jnp.zeros_like(cache_positions)
-#         .at[cache_positions % cache_len]
-#         .set(cache_positions)
-#     )
-#     return cache_positions
-
-#   cache_positions = jax.lax.cond(
-#       total_tokens <= cache_len,
-#       lambda: jnp.arange(cache_len),
-#       _reconstruct_rotated_cache_positions,
-#   )
-
-#   cache_positions = cache_positions[None, None, :]
-#   segment_pos = segment_pos[:, :, None]
-#   mask = cache_positions > segment_pos - sliding_window_size
-#   mask *= cache_positions < segment_pos + sliding_window_size
-#   return mask
+# ---------------------------------------------------------------------------
+# Ragged attention wrapper (MaxText kernel)
+# ---------------------------------------------------------------------------
+try:
+    from MaxText.kernels.ragged_attention import ragged_mha as _ragged_mha
+    from MaxText.kernels.ragged_attention import ragged_gqa as _ragged_gqa
+except ImportError:           # keeps unit‑tests working when MaxText is absent
+    _ragged_mha, _ragged_gqa = None, None
 
 
-# def build_sliding_mask(
-#     position_ids: Array,  # (B, T) int32
-#     total_tokens: int,
-#     *,
-#     cache_len: int,
-#     sliding_window_size: int,
-# ) -> Array:
-#   """
-#   Return a boolean mask with shape (B, T, cache_len) that is True for
-#   cache positions within W (window_size) tokens of each query token.
-#   """
-#   window = sliding_window_size
+def ragged_multi_head_attention(
+    q: Array,                  # (B, 1, N, H)    – generation step ⇒ T==1
+    k: Array,                  # (B, S, K, H)
+    v: Array,                  # (B, S, K, H)
+    lengths: Array,            # (B,)            – valid tokens in cache
+) -> Array:                    # (B, 1, N, H)
 
-#   # 1. Re-create absolute positions that live in the ring-buffer cache.
-#   #    If total_tokens has not yet wrapped we can use a simple arange.
-#   cache_pos = jax.lax.cond(
-#       total_tokens <= cache_len,
-#       lambda _: jnp.arange(cache_len, dtype=jnp.int32),
-#       lambda _: (
-#           # rotated ring buffer: oldest token is (total tokens - cache_len)
-#           (jnp.arange(cache_len, dtype=jnp.int32) + total_tokens - cache_len)
-#       ),
-#       operand=None,
-#   )  # (cache_len,)
+    if _ragged_mha is None or _ragged_gqa is None:
+        raise RuntimeError("MaxText ragged kernels not found in PYTHONPATH")
 
-#   # 2. Compute signed distance between each (query, key) pair.
-#   #    diff shape: (B, T, cache_len)
-#   diff = cache_pos[None, None, :] - position_ids[:, :, None]
+    B, T, N, H = q.shape
+    _, S, K, _ = k.shape
+    assert T == 1, "ragged kernels only support the single‑token decode path"
 
-#   # 3. Inside window  we attend,  otherwise  mask out
-#   mask = (diff > -window) & (diff < window)
-#   return mask
+    #   • MHA path (N == K)                – full‑head cache
+    #   • GQA path (N >  K)                – grouped query attention
+    if N == K:
+        out, *_ = _ragged_mha(q, k, v, lengths)        # (B, 1, N, H)
+    else:
+        # ragged_gqa expects q  (B, N,  H); k,v as given.
+        out, *_ = _ragged_gqa(q.squeeze(1), k, v, lengths)
+        out = out.reshape(B, 1, N, H)
 
-
-
-# def build_combined_attn_mask(attn_mask: Array, attn_type: AttentionType, positions: Array, seq_lens: Array, config: AttentionConfig) -> Array:
-#   attn_mask_BTS = attn_mask
-#   if attn_type == AttentionType.LOCAL_SLIDING:
-#     total = jnp.max(seq_lens).item()
-#     sliding_mask_BTS = build_sliding_mask(
-#         positions,
-#         total,
-#         cache_len=config.cache_length,
-#         sliding_window_size=config.window_size,
-#     )
-#     attn_mask_BTS = attn_mask_BTS & sliding_mask_BTS
-
-#   return attn_mask_BTS
-
-# def compute_sliding_window_mask(
-#     positions: Array,
-#     seq_len: int,
-#     window_size: int,
-# ) -> Array:
-#     pos_diff = positions[:, :, None] - jnp.arange(seq_len)[None, None, :]
-#     mask = (pos_diff >= -window_size) & (pos_diff < window_size)
-#     mask = mask & (pos_diff >= 0)
-#     return mask
-
-# def build_gen_step_attn_masks(
-#     time_step: int | Array, # (), or a batched 2D array of time steps (B,1)   int32
-#     seq_len: int,
-#     input_mask: Array,  # (B, seq_len) bool
-# ) -> Array:
-#   """
-#   Produce (B, 1, seq_len) causal masks needed at each generation from input_mask:(B, seq_len) bool.
-#   Works entirely on device with broadcasting; no per step Python allocation.
-#   """
-#   # Broadcast compare:  shape (seq_len,)
-#   causal = jnp.arange(seq_len, dtype=jnp.int32) <= time_step
-
-#   # Combine with the per-example padding mask and give final shape
-#   return (causal[None, :] & input_mask).reshape(input_mask.shape[0], 1, seq_len)
+    return out.astype(q.dtype)
 
 
 # -----------------------------------------------------------------------------
