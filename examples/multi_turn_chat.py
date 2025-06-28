@@ -10,6 +10,9 @@
 
 # %%
 
+import argparse
+import os
+import sys
 import queue
 import threading
 
@@ -17,7 +20,6 @@ import time
 from functools import partial
 import math
 from pathlib import Path
-import os
 from typing import Any
 
 import numpy as np
@@ -70,7 +72,6 @@ def get_repo_root():
 
 def maybe_get_paths_from_args(default_checkpoint_path: Path, default_tokenizer_path: Path):
     """Get the paths from the command line arguments."""
-    import argparse
     try:
         parser = argparse.ArgumentParser()
         parser.add_argument("--checkpoint_path", type=str, default=None)
@@ -94,6 +95,66 @@ def maybe_get_paths_from_args(default_checkpoint_path: Path, default_tokenizer_p
     except:
         return default_checkpoint_path, default_tokenizer_path
 
+
+
+def _parse_arguments():
+    """
+    Parses command-line arguments for paths, safely handling notebook environments.
+
+    This is a helper function designed not to be called directly by the user.
+    """
+    parser = argparse.ArgumentParser(
+        description="Provide optional paths for a model checkpoint and tokenizer."
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="Path to the model checkpoint file. If not provided, a default will be used."
+    )
+    parser.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default=None,
+        help="Path to the tokenizer file. If not provided, a default will be used."
+    )
+
+    # Detect if the script is running in an interactive notebook (like Colab or Jupyter).
+    # The kernel passes its own arguments, which we want to ignore.
+    if any('colab_kernel_launcher' in arg for arg in sys.argv) or any('ipykernel_launcher' in arg for arg in sys.argv):
+        # In a notebook, parse an empty list of arguments to avoid conflicts.
+        # This makes argparse use the default values we defined (which is None).
+        print("INFO: Running in a notebook environment. Ignoring command-line arguments.")
+        args = parser.parse_args([])
+    else:
+        # When run from a terminal, parse the arguments as usual.
+        args = parser.parse_args()
+
+    return args
+
+def maybe_get_paths_from_args(default_checkpoint_path: Path, default_tokenizer_path: Path) -> tuple[Path, Path]:
+    """
+    Gets checkpoint and tokenizer paths, prioritizing command-line args over defaults.
+
+    This function can be safely called from a script or an interactive notebook cell.
+
+    Args:
+        default_checkpoint_path: The default path to use if no checkpoint is provided via CLI.
+        default_tokenizer_path: The default path to use if no tokenizer is provided via CLI.
+
+    Returns:
+        A tuple containing the final (Path, Path) for the checkpoint and tokenizer.
+    """
+    # 1. Get arguments from the command line (or None if in a notebook/not provided)
+    cli_args = _parse_arguments()
+
+    # 2. Decide which path to use. Prioritize the one from the command line.
+    checkpoint_path = Path(cli_args.checkpoint_path) if cli_args.checkpoint_path else default_checkpoint_path
+    tokenizer_path = Path(cli_args.tokenizer_path) if cli_args.tokenizer_path else default_tokenizer_path
+
+    return checkpoint_path, tokenizer_path
+
+
 # %% [markdown]
 # ### Configuration Defaults
 #
@@ -115,11 +176,12 @@ except ImportError:
 
 if IN_COLAB:
     print(f"Running in Google Colab. Current directory: {os.getcwd()}")
-    root_dir = Path('/content/gemma-jax')
+    root_dir = Path('/content/gemma_jax')
     TOKENIZER_PATH =  root_dir / 'tokenizer.model'       # Absolute path to the Gemma model checkpoint
     CHECKPOINT_PATH =  Path("/content/drive/MyDrive/4b") # Absolute path to the Gemma model checkpoint
 
 if IN_SCRIPT:
+
     try:
         print("Getting paths from args...")
         CHECKPOINT_PATH, TOKENIZER_PATH = maybe_get_paths_from_args(CHECKPOINT_PATH, TOKENIZER_PATH)
@@ -763,8 +825,8 @@ print(f"Setup generate completed in {time.time() - t0:.2f}s")
 
 # Time the generation
 t0 = time.time()
-total_tokens = 32 # Total number of tokens to generate
-run_chunk_size = 32 # Number of tokens to generate in each chunk
+total_tokens = config.generate_steps # Total number of tokens to generate
+run_chunk_size = config.chunk_length # Number of tokens to generate in each chunk
 _ = run_full_generation_with_chunked_callback(
     init_carry,
     model=model,

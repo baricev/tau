@@ -10,6 +10,9 @@ import jax.numpy as jnp
 from pathlib import Path
 import threading
 
+import queue
+
+# Updated imports for new API
 from setup import (
     model,
     tokenizer,
@@ -18,17 +21,22 @@ from setup import (
     cache,
     rope_cache,
     encode_text,
-    chunked_prefill,
-    setup_carry,
-    paxml_generate_chunked_scan_queue,
-    _CHUNK_QUEUE,
-    _consumer_t,
-    _GENERATION_COMPLETE,
-    _CONSUMER_STARTED,
-    _EXPECTED_CHUNKS,
-    _PROCESSED_CHUNKS,
-    _CHUNKS_LOCK
 )
+
+# Import necessary components for the new API
+from gemma_jax.core.model import forward_fn, decode
+from gemma_jax.core.segment import SegmentInfo
+from gemma_jax.core.cache import KVCache
+from typing import Any
+
+# Queue-based chunked generation globals
+_CHUNK_QUEUE = queue.Queue()
+_GENERATION_COMPLETE = threading.Event()
+_CONSUMER_STARTED = threading.Event()
+_EXPECTED_CHUNKS = 0
+_PROCESSED_CHUNKS = 0
+_CHUNKS_LOCK = threading.Lock()
+_consumer_t = None
 
 PAD_ID, EOS_ID, BOS_ID, END_OF_TURN_ID = 0, 1, 2, 106
 
@@ -93,6 +101,214 @@ def consumer_thread_with_collection():
         _CHUNK_QUEUE.task_done()
     
     print("[Consumer thread] Exiting.")
+
+# Helper: Build position ids
+def build_positions(mask: jax.Array) -> jax.Array:
+    pos = jnp.cumsum(mask, axis=-1)
+    return pos - (pos >= 1)
+
+def make_chunk_mask(
+    batch_size: int,
+    start_idx: int,
+    chunk_length: int,
+    cache_length: int,
+) -> jax.Array:
+    """
+    Build a (B, T_chunk, cache_length) causal mask for a chunk length.
+    """
+    q_pos = jnp.arange(chunk_length, dtype=jnp.int32)[:, None] + start_idx
+    k_pos = jnp.arange(cache_length, dtype=jnp.int32)[None, :]
+    mask = k_pos <= q_pos  # (T_chunk, cache_length)
+    mask = jnp.broadcast_to(mask, (batch_size, *mask.shape))
+    return mask
+
+@jax.jit
+def setup_carry(*, state: Any, input_ids: jax.Array, prefill_cache: Any) -> tuple:
+    """Prepare the new SegmentInfo‑based carry."""
+    B         = input_ids.shape[0]
+    seq_lens  = (input_ids != 0).sum(axis=-1)                      # (B,)
+    last_tok  = input_ids[jnp.arange(B), seq_lens - 1]             # (B,)
+
+    seg_info = SegmentInfo(
+        lengths=seq_lens,      # tokens already in cache
+        cursor=seq_lens,       # next write slot
+        offset=jnp.zeros_like(seq_lens),
+        cache_len=int(prefill_cache.max_seq_len),
+    )
+
+    carry = (
+        last_tok,              # 0 current input token (B,)
+        seg_info,              # 1 SegmentInfo
+        0,                     # 2 step counter
+        prefill_cache,         # 3 KV‑cache
+        state,                 # 4 model params/state
+    )
+    return carry
+
+# Chunked prefill implementation using static shapes
+@partial(jax.jit, static_argnames=("config", "chunk_length", "cache_length"))
+def chunked_prefill(
+    state: Any,
+    input_ids: jax.Array,  # (B, S_total)
+    model: Any,
+    cache: KVCache,
+    rope_cache: Any,
+    config: Any,
+    *,
+    chunk_length: int,
+    cache_length: int,
+) -> KVCache:
+    """
+    Process an arbitrarily long prompt in fixed-size chunks using static shapes.
+    Returns the filled KV-cache.
+    """
+
+    batch_size, seq_len = input_ids.shape
+
+    num_chunks = seq_len // chunk_length + (seq_len % chunk_length > 0)
+
+    # Pad tokens to multiple of chunk_length so shapes remain static
+    pad_len = num_chunks * chunk_length - seq_len
+    padded_input_ids = jnp.pad(input_ids, ((0, 0), (0, pad_len)), constant_values=0)
+
+    # Compute absolute positions
+    padded_attn_mask = padded_input_ids != 0
+    padded_position_ids = build_positions(padded_attn_mask)
+
+    seq_lens_B = padded_attn_mask.sum(axis=-1)
+
+    def body(carry, idx):
+        kv_cache, model_state = carry
+
+        start = idx * chunk_length
+
+        tok_chunk = jax.lax.dynamic_slice(
+            padded_input_ids, (0, start), (batch_size, chunk_length)
+        )
+        pos_chunk = jax.lax.dynamic_slice(
+            padded_position_ids, (0, start), (batch_size, chunk_length)
+        )
+
+        write_idx_B = jnp.full((batch_size,), start, dtype=jnp.int32)
+
+        # SegmentInfo describing the cache **before** this chunk is written
+        seg_info = SegmentInfo(
+            lengths=write_idx_B,          # prompt length so far   (B,)
+            cursor=write_idx_B,           # write head starts here (B,)
+            offset=jnp.zeros_like(write_idx_B),
+            cache_len=int(cache_length),
+        )
+
+        _, updated_cache = forward_fn(
+            model_state,
+            tok_chunk,
+            pos_chunk,
+            seg_info,                     # NEW: SegmentInfo instead of attention mask
+            model=model,
+            cache=kv_cache,
+            rope_cache=rope_cache,
+            config=config,
+            auto_regressive=False,
+            mesh=None,                    # keep None – single‑host
+        )
+
+        return (updated_cache, model_state), None
+
+    (filled_cache, _), _ = jax.lax.scan(body, (cache, state), jnp.arange(num_chunks))
+
+    return filled_cache
+
+@partial(jax.jit, static_argnames=("config"))
+def _generate_one_step(
+    carry,
+    *,
+    model,
+    rope_cache,
+    config,
+):
+    """
+    Single token autoregressive step (jitted) using new SegmentInfo API.
+    """
+    (cur_tok, seg_info, step, kv_cache, model_state) = carry
+
+    batch   = cur_tok.shape[0]
+    cache_L = config.cache_length
+
+    x_emb, updated_kv_cache = forward_fn(
+        model_state,
+        cur_tok[:, None],
+        seg_info.current_pos[:, None],
+        seg_info,                         # NEW: SegmentInfo instead of attention mask
+        model=model,
+        cache=kv_cache,
+        rope_cache=rope_cache,
+        config=config,
+        auto_regressive=True,
+        mesh=None,
+    )
+
+    logits   = decode(model, x_emb).squeeze(axis=1)          # shape (B,1,V) -> (B, V)
+    next_tok = jnp.argmax(logits, axis=-1).astype(jnp.int32) # shape (B,)
+
+    new_carry = (
+        next_tok,
+        seg_info.advance(1),              # NEW: advance SegmentInfo
+        step + 1,
+        updated_kv_cache,
+        model_state,
+    )
+    return new_carry, next_tok
+
+@partial(jax.jit, static_argnames=("config", "chunk_size", "chunk_id"))
+def paxml_generate_chunked_scan_queue(
+    init_carry,
+    *,
+    model,
+    rope_cache,
+    config,
+    chunk_size: int,
+    chunk_id: int,
+):
+    """
+    Single compiled function that does chunk_size steps in one scan,
+    then returns the entire chunk. Uses new SegmentInfo API.
+    """
+
+    def step_fn(carry, _):
+        new_carry, next_tok = _generate_one_step(
+            carry,
+            model=model,
+            rope_cache=rope_cache,
+            config=config
+        )
+        return new_carry, next_tok  # shape (B,)
+
+    final_carry, tokens_chunk = jax.lax.scan(
+        step_fn,
+        init_carry,
+        xs=None,
+        length=chunk_size
+    )
+    # tokens_chunk has shape (chunk_size, B)
+
+    # Minimal callback: do a quick device->host copy, then enqueue
+    def tap_chunk(dev_chunk):
+        # Quick device->host (use jax.device_get for non-blocking transfer)
+        chunk_host = jax.device_get(dev_chunk)  # shape (chunk_size, B)
+        # Put on a queue for decoding
+        _CHUNK_QUEUE.put({
+            "chunk_id": chunk_id,
+            "chunk": chunk_host
+        })
+
+    # Attach the callback
+    jax.experimental.io_callback(
+            tap_chunk,
+            None,
+            tokens_chunk,
+            ordered=True)
+
+    return final_carry, tokens_chunk
 
 def run_generation_and_collect_tokens(
     init_carry,
@@ -360,9 +576,9 @@ if __name__ == "__main__":
         state=state,
         cache=cache,
         rope_cache=rope_cache,
-        num_conversations=2, # num_conversations must equal batch size
+        num_conversations=config.batch_size, # num_conversations must equal batch size
         max_turns=2,
-        max_tokens_per_turn=64,
+        max_tokens_per_turn=config.generate_steps,
         temperature=0.8,
         output_path="synthetic_conversations.jsonl"
     )
