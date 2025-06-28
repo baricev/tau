@@ -477,10 +477,17 @@ def self_attention(
     # For prefill (non-ragged), pass positions to get per-token masks
     query_positions = None if ragged else positions
     
+    # A window size of 0 disables sliding-window masking
+    window = (
+        layer_config.window_size
+        if attn_type == AttentionType.LOCAL_SLIDING and layer_config.window_size > 0
+        else None
+    )
+
     cache_key, cache_value, lookup_mask = cache.lookup_layer(
         seg_info_for_lookup,  # Use the advanced seg_info here
         layer=layer_idx,
-        window=layer_config.window_size if attn_type == AttentionType.LOCAL_SLIDING else None,
+        window=window,
         query_positions=query_positions,
     )
 
@@ -500,7 +507,14 @@ def self_attention(
     query_scaled = query * layer_config.query_pre_attn_scalar
 
     # Determine if we should use ragged attention for variable-length sequences
-    use_ragged = ragged and hasattr(layer_config, 'use_ragged_attention') and layer_config.use_ragged_attention
+    use_ragged = (
+        ragged
+        and hasattr(layer_config, 'use_ragged_attention')
+        and layer_config.use_ragged_attention
+    )
+    if use_ragged and attn_type == AttentionType.LOCAL_SLIDING:
+        # Sliding-window masking is not yet supported in ragged kernels
+        use_ragged = False
     
     if use_ragged:
         # Use sequence lengths from SegmentInfo for ragged attention
@@ -509,7 +523,7 @@ def self_attention(
             query_scaled.astype(jnp.float32),
             cache_key.astype(jnp.float32),
             cache_value.astype(jnp.float32),
-            seg_info.lengths,  # Pass sequence lengths for ragged attention
+            seg_info_for_lookup.lengths,  # include newly written token
             use_fused_kernel=True,
             use_ragged_attention=True,
         ).astype(x.dtype)

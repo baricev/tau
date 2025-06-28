@@ -159,6 +159,41 @@ def test_padding_elimination_benefit():
         assert False
 
 
+def test_generation_token_attends_to_self():
+    """The generated token must be included in ragged attention."""
+    B, T, N, H = 1, 1, 4, 32
+    S = 5
+
+    key = jax.random.PRNGKey(789)
+    k1, k2, k3 = jax.random.split(key, 3)
+
+    q = jax.random.normal(k1, (B, T, N, H), dtype=jnp.bfloat16)
+    k = jax.random.normal(k2, (B, S, N, H), dtype=jnp.bfloat16)
+    v = jax.random.normal(k3, (B, S, N, H), dtype=jnp.bfloat16)
+
+    lengths = jnp.array([S - 1], dtype=jnp.int32)
+
+    mask = jnp.arange(S) < (lengths + 1)
+    attn_mask = mask.reshape(B, T, S)
+
+    out_mask = multi_head_attention(
+        q, k, v, attn_mask,
+        use_fused_kernel=False,
+        use_ragged_attention=False,
+    )
+
+    try:
+        out_ragged = multi_head_attention(
+            q, k, v, lengths + 1,
+            use_fused_kernel=False,
+            use_ragged_attention=True,
+        )
+    except Exception as e:
+        pytest.skip(f"ragged kernel unavailable: {e}")
+
+    assert jnp.allclose(out_mask, out_ragged, atol=1e-2)
+
+
 def test_different_sequence_lengths():
     """Test ragged attention with various sequence length patterns."""
     print("\n" + "="*60)

@@ -73,3 +73,47 @@ def test_ring_buffer_wrap_once():
 
     print(f"test_ring_buffer_wrap_once passed: {ring_contents=}, {seg.lengths=}, {seg.cursor=}, {seg.offset=}")
 
+
+def test_update_cache_layer_counters_once():
+    """Sequence length should not advance for each layer update."""
+    BATCH = 1
+    CACHE_LEN = 8
+
+    cache = init_cache(
+        batch=BATCH,
+        max_seq_len=CACHE_LEN,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=1,
+        dtype=jnp.bfloat16,
+    )
+
+    seg = SegmentInfo(
+        lengths=jnp.zeros((BATCH,), dtype=jnp.int32),
+        cursor=jnp.zeros((BATCH,), dtype=jnp.int32),
+        offset=jnp.zeros((BATCH,), dtype=jnp.int32),
+        cache_len=CACHE_LEN,
+    )
+
+    k_proj = jnp.ones((BATCH, 1, 1, 1), dtype=jnp.bfloat16)
+    v_proj = jnp.ones((BATCH, 1, 1, 1), dtype=jnp.bfloat16)
+    step_len = jnp.ones((BATCH,), dtype=jnp.int32)
+
+    _, _, cache = update_cache_layer(
+        cache, k_proj, v_proj,
+        seg_info=seg,
+        chunk_lens_B=step_len,
+        layer=0,
+        ragged=True,
+    )
+    _, _, cache = update_cache_layer(
+        cache, k_proj, v_proj,
+        seg_info=seg,
+        chunk_lens_B=step_len,
+        layer=0,
+        ragged=True,
+    )
+
+    assert int(cache.sequence_lengths[0]) == 1
+    assert int(cache.write_positions[0]) == 1
+
