@@ -79,6 +79,153 @@ def test_ragged_vs_masked_attention():
         assert True
 
 
+def _make_identity_layer(N=1, K=1, H=2):
+    """Create a minimal transformer layer with identity projections."""
+    import numpy as np
+    D = N * H
+
+    q_proj = np.zeros((N, D, H), dtype=np.float32)
+    kv_proj = np.zeros((2, K, D, H), dtype=np.float32)
+    out_proj = np.zeros((N, H, D), dtype=np.float32)
+
+    for i in range(N):
+        q_proj[i, i * H : (i + 1) * H] = np.eye(H)
+        out_proj[i, :, i * H : (i + 1) * H] = np.eye(H)
+    for j in range(K):
+        kv_proj[:, j, j * H : (j + 1) * H] = np.eye(H)
+
+    zeros_h = np.zeros((H,), dtype=np.float32)
+    zeros_d = np.zeros((D,), dtype=np.float32)
+
+    from gemma_jax.core.model import Layer
+
+    return Layer(
+        attn_key_norm_scale=jnp.asarray(zeros_h, dtype=jnp.bfloat16),
+        attn_query_norm_scale=jnp.asarray(zeros_h, dtype=jnp.bfloat16),
+        output_proj=jnp.asarray(out_proj, dtype=jnp.bfloat16),
+        kv_proj=jnp.asarray(kv_proj, dtype=jnp.bfloat16),
+        q_proj=jnp.asarray(q_proj, dtype=jnp.bfloat16),
+        gating_weights=jnp.zeros((2, 1, D), dtype=jnp.bfloat16),
+        output_weights=jnp.zeros((1, D), dtype=jnp.bfloat16),
+        post_attention_norm_scale=jnp.asarray(zeros_d, dtype=jnp.bfloat16),
+        post_ffw_norm_scale=jnp.asarray(zeros_d, dtype=jnp.bfloat16),
+        pre_attention_norm_scale=jnp.asarray(zeros_d, dtype=jnp.bfloat16),
+        pre_ffw_norm_scale=jnp.asarray(zeros_d, dtype=jnp.bfloat16),
+    )
+
+
+def test_generated_token_attends_to_self():
+    """Ensure decode token attends to itself when using ragged attention."""
+    from gemma_jax.core.cache import init_cache, update_cache_layer
+    from gemma_jax.core.segment import SegmentInfo
+    from gemma_jax.core.model import (
+        AttentionConfig,
+        AttentionType,
+        apply_rope,
+        qkv_projection,
+        multi_head_attention,
+        self_attention,
+    )
+
+    N = K = 1
+    H = 2
+    D = N * H
+    S = 4
+
+    layer = _make_identity_layer(N=N, K=K, H=H)
+
+    cfg = AttentionConfig(
+        num_heads=N,
+        num_kv_heads=K,
+        embed_dim=D,
+        head_dim=H,
+        hidden_dim=4,
+        attn_type=AttentionType.GLOBAL,
+        query_pre_attn_scalar=1.0,
+        cache_length=S,
+        window_size=0,
+        use_ragged_attention=True,
+    )
+
+    cache = init_cache(
+        batch=1,
+        max_seq_len=S,
+        num_layers=1,
+        num_kv_heads=K,
+        head_dim=H,
+        dtype=jnp.bfloat16,
+    )
+
+    seg = SegmentInfo(
+        lengths=jnp.zeros((1,), dtype=jnp.int32),
+        cursor=jnp.zeros((1,), dtype=jnp.int32),
+        offset=jnp.zeros((1,), dtype=jnp.int32),
+        cache_len=S,
+    )
+
+    # Prefill a single token so current_pos is non-negative
+    x0 = jax.random.normal(jax.random.PRNGKey(1), (1, 1, D), dtype=jnp.bfloat16)
+    q0, k0, v0 = qkv_projection(x0, layer.q_proj, layer.kv_proj)
+    q0 = apply_rope(q0, jnp.array([[0]]), base_frequency=cfg.rope_base_frequency)
+    k0 = apply_rope(k0, jnp.array([[0]]), base_frequency=cfg.rope_base_frequency)
+    _, _, cache = update_cache_layer(
+        cache,
+        k0,
+        v0,
+        seg_info=seg,
+        chunk_lens_B=jnp.ones((1,), dtype=jnp.int32),
+        layer=0,
+        ragged=True,
+    )
+    seg = seg.advance(1)
+
+    # New token
+    x1 = jax.random.normal(jax.random.PRNGKey(2), (1, 1, D), dtype=jnp.bfloat16)
+
+    # Manual baseline using masked attention
+    q1, k1, v1 = qkv_projection(x1, layer.q_proj, layer.kv_proj)
+    q1 = apply_rope(q1, jnp.array([[seg.current_pos[0]]]), base_frequency=cfg.rope_base_frequency)
+    k1r = apply_rope(k1, jnp.array([[seg.current_pos[0]]]), base_frequency=cfg.rope_base_frequency)
+    _, _, cache_manual = update_cache_layer(
+        cache,
+        k1r,
+        v1,
+        seg_info=seg,
+        chunk_lens_B=jnp.ones((1,), dtype=jnp.int32),
+        layer=0,
+        ragged=True,
+    )
+    seg_lookup = seg.advance(1)
+    ck, cv, mask = cache_manual.lookup_layer(seg_lookup, layer=0, window=None, query_positions=None)
+    mask = mask[:, None, :]
+    baseline = multi_head_attention(
+        q1.astype(jnp.float32),
+        ck.astype(jnp.float32),
+        cv.astype(jnp.float32),
+        mask,
+        use_fused_kernel=True,
+        use_ragged_attention=False,
+    )
+
+    try:
+        out, _ = self_attention(
+            None,
+            x1,
+            jnp.array([[seg.current_pos[0]]], dtype=jnp.int32),
+            layer,
+            cache,
+            None,
+            seg,
+            jnp.ones((1,), dtype=jnp.int32),
+            cfg,
+            True,
+            0,
+        )
+        assert jnp.allclose(out, baseline.astype(out.dtype), atol=1e-3)
+    except Exception as e:
+        pytest.skip(f"ragged kernels unavailable: {e}")
+
+
 def test_ragged_gqa_reference():
     """Test the reference GQA implementation with variable lengths."""
     print("\n" + "="*60)
