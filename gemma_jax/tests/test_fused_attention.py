@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Test script for the fused attention implementation in gemma_jax."""
 
+# NOTE: Running this file directly requires setting
+# `export PYTHONPATH=$PWD:$PYTHONPATH`.
+
 import jax
 import jax.numpy as jnp
 import numpy as np

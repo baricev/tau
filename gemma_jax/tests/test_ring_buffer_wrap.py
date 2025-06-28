@@ -8,6 +8,9 @@ Ensure that when more tokens than `cache_len` are written
 This catches fence‑post errors that only show up after very long sequences.
 """
 
+# NOTE: Running this file directly requires setting
+# `export PYTHONPATH=$PWD:$PYTHONPATH`.
+
 import jax
 import jax.numpy as jnp
 

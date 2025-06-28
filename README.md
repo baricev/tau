@@ -74,6 +74,16 @@ Basic chat interface CLI:
 python examples/chat_cli.py
 ```
 
+### Running Tests
+
+To run the test files directly with `python gemma_jax/tests/test_*.py`, first set
+the repository root on `PYTHONPATH`:
+
+```bash
+export PYTHONPATH=$PWD:$PYTHONPATH
+python gemma_jax/tests/test_fused_attention.py  # for example
+```
+
 ## Acknowledgements
 
 * Special thanks to Google's TPU Research Cloud for their generous support. Please see [Google TPU Research Cloud (TRC)](https://sites.research.google/trc/about/) for more information on the program.

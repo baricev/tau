@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Test script for ragged attention implementation in Gemma JAX."""
 
+# NOTE: Running this file directly requires setting
+# `export PYTHONPATH=$PWD:$PYTHONPATH`.
+
 import jax
 import jax.numpy as jnp
 import numpy as np
