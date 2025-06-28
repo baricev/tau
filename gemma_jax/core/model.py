@@ -19,6 +19,13 @@ from gemma_jax.core.cache import KVCache, update_cache_layer
 from gemma_jax.core.rope import apply_rope_cached
 from gemma_jax.core.segment import SegmentInfo
 
+# ---------------------------------------------------------------------------
+# Ragged attention wrapper (MaxText kernel)
+# ---------------------------------------------------------------------------
+from gemma_jax.core.ragged_attention import ragged_mha as _ragged_mha
+from gemma_jax.core.ragged_attention import ragged_gqa as _ragged_gqa
+
+
 # -----------------------------------------------------------------------------
 # Transformer class
 # -----------------------------------------------------------------------------
@@ -192,11 +199,11 @@ def mask_to_lengths(mask: Array) -> Array:
 # ---------------------------------------------------------------------------
 # Ragged attention wrapper (MaxText kernel)
 # ---------------------------------------------------------------------------
-try:
-    from MaxText.kernels.ragged_attention import ragged_mha as _ragged_mha
-    from MaxText.kernels.ragged_attention import ragged_gqa as _ragged_gqa
-except ImportError:           # keeps unit‑tests working when MaxText is absent
-    _ragged_mha, _ragged_gqa = None, None
+# try:
+#     from MaxText.kernels.ragged_attention import ragged_mha as _ragged_mha
+#     from MaxText.kernels.ragged_attention import ragged_gqa as _ragged_gqa
+# except ImportError:           # keeps unit‑tests working when MaxText is absent
+#     _ragged_mha, _ragged_gqa = None, None
 
 
 def ragged_multi_head_attention(

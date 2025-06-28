@@ -21,6 +21,7 @@ from setup import (
     cache,
     rope_cache,
     encode_text,
+    reset_threading_state,
 )
 
 # Import necessary components for the new API
@@ -569,6 +570,9 @@ def run_multiturn_generation(
     return conversations
 
 if __name__ == "__main__":
+    # Reset threading state to avoid conflicts from setup.py import
+    reset_threading_state()
+    
     conversations = run_multiturn_generation(
         model=model,
         tokenizer=tokenizer,

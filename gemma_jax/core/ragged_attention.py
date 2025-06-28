@@ -338,12 +338,6 @@ def ragged_mha(
   o = o * l
   return o, m, l
 
-# ---------------------------------------------------------------------------
-# Convenience alias expected by tests
-# ---------------------------------------------------------------------------
-from gemma_jax.core.model import ragged_multi_head_attention  # noqa: E402 F401
-
-
 
 @functools.partial(
     jax.jit,
