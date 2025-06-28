@@ -73,3 +73,48 @@ def test_ring_buffer_wrap_once():
 
     print(f"test_ring_buffer_wrap_once passed: {ring_contents=}, {seg.lengths=}, {seg.cursor=}, {seg.offset=}")
 
+
+def test_bookkeeping_multi_layer_single_step():
+    """Cache counters should advance once per generation step, not per layer."""
+
+    BATCH = 1
+    CACHE_LEN = 8
+    NUM_LAYERS = 2
+    NUM_KV_HEAD = 1
+    HEAD_DIM = 1
+
+    cache = init_cache(
+        batch=BATCH,
+        max_seq_len=CACHE_LEN,
+        num_layers=NUM_LAYERS,
+        num_kv_heads=NUM_KV_HEAD,
+        head_dim=HEAD_DIM,
+        dtype=jnp.bfloat16,
+    )
+    seg = SegmentInfo(
+        lengths=jnp.zeros((BATCH,), dtype=jnp.int32),
+        cursor=jnp.zeros((BATCH,), dtype=jnp.int32),
+        offset=jnp.zeros((BATCH,), dtype=jnp.int32),
+        cache_len=CACHE_LEN,
+    )
+
+    key_proj = jnp.ones((BATCH, 1, NUM_KV_HEAD, HEAD_DIM), jnp.bfloat16)
+    value_proj = key_proj
+    chunk = jnp.ones((BATCH,), jnp.int32)
+
+    for layer in range(NUM_LAYERS):
+        _, _, cache = update_cache_layer(
+            cache,
+            key_proj,
+            value_proj,
+            seg_info=seg,
+            chunk_lens_B=chunk,
+            layer=layer,
+            ragged=True,
+        )
+
+    # Counters should only reflect a single token write
+    assert int(cache.sequence_lengths[0]) == 1
+    assert int(cache.write_positions[0]) == 1
+
+

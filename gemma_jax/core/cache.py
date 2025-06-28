@@ -354,10 +354,12 @@ def update_cache_layer(
         )
 
     # ---- bookkeeping (legacy fields) -------------------------------------
-    new_seq_len = jnp.maximum(cache.sequence_lengths,
-                              write_pos_B + seq_lens_B)
-    new_seq_len = jnp.minimum(new_seq_len, cache.cache_len)
-    new_write_pos = (cache.write_positions + seq_lens_B) % cache.cache_len
+    # Bookkeeping should reflect the state after this write, independent of
+    # how many layers are updated in a single forward pass.  Derive the new
+    # counters from ``seg_info`` rather than the cache's previous values to
+    # avoid incrementing them multiple times.
+    new_seq_len = jnp.minimum(seg_info.lengths + seq_lens_B, cache.cache_len)
+    new_write_pos = (seg_info.cursor + seq_lens_B) % cache.cache_len
 
     # [REFACTORED] Construct the new cache with all updated fields
     new_cache = KVCache(
