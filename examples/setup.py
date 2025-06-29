@@ -20,6 +20,7 @@ from jax import Array
 
 from gemma_jax.core.weights import create_config  as original_create_gemma3_config
 from gemma_jax.core.weights import create_device_mesh, load_model, load_unsharded_model
+from gemma_jax.core.weights import load_multi_modal_model, load_unsharded_multi_modal_model
 from gemma_jax.core.rope import init_rope_cache, load_rope_cache
 from gemma_jax.core.sp_tokenizer import SentencePieceTokenizer, encode_raw_ids, process_and_pad_inputs, encode_text, decode_tokens, format_prompt
 from gemma_jax.core.inference import greedy_sample
@@ -83,6 +84,12 @@ def _parse_arguments():
         default=None,
         help="Path to the tokenizer file. If not provided, a default will be used."
     )
+    parser.add_argument(
+        '--use_multi_modal',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the multi-modal model. Default is True. Use --no-use-multi-modal to disable."
+    )
 
     # Detect if the script is running in an interactive notebook (like Colab or Jupyter).
     # The kernel passes its own arguments, which we want to ignore.
@@ -97,7 +104,7 @@ def _parse_arguments():
 
     return args
 
-def maybe_get_paths_from_args(default_checkpoint_path: Path, default_tokenizer_path: Path) -> tuple[Path, Path]:
+def maybe_get_paths_from_args(default_checkpoint_path: Path, default_tokenizer_path: Path) -> tuple[Path, Path, bool]:
     """
     Gets checkpoint and tokenizer paths, prioritizing command-line args over defaults.
 
@@ -116,8 +123,9 @@ def maybe_get_paths_from_args(default_checkpoint_path: Path, default_tokenizer_p
     # 2. Decide which path to use. Prioritize the one from the command line.
     checkpoint_path = Path(cli_args.checkpoint_path) if cli_args.checkpoint_path else default_checkpoint_path
     tokenizer_path = Path(cli_args.tokenizer_path) if cli_args.tokenizer_path else default_tokenizer_path
+    use_multi_modal = cli_args.use_multi_modal
 
-    return checkpoint_path, tokenizer_path
+    return checkpoint_path, tokenizer_path, use_multi_modal
 
 
 # %% [markdown]
@@ -128,6 +136,7 @@ def maybe_get_paths_from_args(default_checkpoint_path: Path, default_tokenizer_p
 # %%
 TOKENIZER_PATH = get_repo_root() / "tokenizer.model"
 CHECKPOINT_PATH = get_repo_root() / "4b"
+USE_MULTI_MODAL = True  # Default for notebooks
 
 IN_NOTEBOOK = in_notebook()
 IN_SCRIPT = not IN_NOTEBOOK
@@ -149,7 +158,7 @@ if IN_SCRIPT:
 
     try:
         print("Getting paths from args...")
-        CHECKPOINT_PATH, TOKENIZER_PATH = maybe_get_paths_from_args(CHECKPOINT_PATH, TOKENIZER_PATH)
+        CHECKPOINT_PATH, TOKENIZER_PATH, USE_MULTI_MODAL = maybe_get_paths_from_args(CHECKPOINT_PATH, TOKENIZER_PATH)
     except:
         pass
 
@@ -222,6 +231,7 @@ def make_model_objects(
     batch_size: int = 2,
     generate_steps: int = 8,
     shard_model: bool = True,
+    use_multi_modal: bool = True,
 ):
     """
     Build the mesh, load weights, create caches, etc.  Matches the notebook.
@@ -253,15 +263,24 @@ def make_model_objects(
     }[dtype_str]
 
     if shard_model:
-        model = load_model(checkpoint_path, mesh, config, dtype=model_dtype)
+        if use_multi_modal:
+            print("Loading sharded multi-modal model...")
+            model = load_multi_modal_model(checkpoint_path, mesh, config, dtype=model_dtype)
+        else:
+            print("Loading sharded model...")
+            model = load_model(checkpoint_path, mesh, config, dtype=model_dtype)
         rope_cache = load_rope_cache(mesh, config)
         kv_cache = shard_kvcache_with_tree_map(kv_cache, mesh, mesh_axes)
 
     else:
         # Load the model without sharding, useful for single-device inference
         # or debugging purposes.
-        print("Loading unsharded model...")
-        model = load_unsharded_model(checkpoint_path, config, dtype=model_dtype)
+        if use_multi_modal:
+            print("Loading unsharded multi-modal model...")
+            model = load_unsharded_multi_modal_model(checkpoint_path, config, dtype=model_dtype)
+        else:
+            print("Loading unsharded model...")
+            model = load_unsharded_model(checkpoint_path, config, dtype=model_dtype)
         rope_cache = init_rope_cache(config)
 
 
@@ -317,7 +336,8 @@ model, tokenizer, rope_cache, cache, config = make_model_objects(
     dtype_str=dtype_str,
     batch_size=batch,
     generate_steps=generate_steps,
-    shard_model=shard_model,  # Set to False for debugging or single-device inference
+    shard_model=shard_model,
+    use_multi_modal=USE_MULTI_MODAL,
 )
 
 # Dummy state for the model, can be used to store additional parameters or state

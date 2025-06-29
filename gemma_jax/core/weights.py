@@ -311,7 +311,7 @@ class EncoderBlock(NamedTuple):
     value_kernel: Array                  # (embed_dim, num_heads, head_dim)         (D,N,H)     
 
 
-class Embedder(NamedTuple):
+class Encoder(NamedTuple):
     encoder_norm_scale          : Array   # (embed_dim,)                            (D,)
     encoder_norm_bias           : Array   # (embed_dim,)                            (D,)
     pos_embedding               : Array   # (1, max_seq_len, embed_dim)  # (1,S,D)
@@ -343,6 +343,13 @@ class Gemma3(NamedTuple):
 # fmt: on
 
 
+class Gemma3MultiModal(NamedTuple):
+    input_embedding_table       :  Array   # (vocab_size, embed_dim)                 (V,D)
+    mm_input_projection         :  Array   # (embed_dim, embed_dim)                  (D,D)
+    mm_soft_embedding_norm      :  Array   # (embed_dim,)                            (D,)
+    final_norm_scale             :  Array   # (embed_dim,)                            (D,)
+    blocks                      :  tuple[Layer, ...]
+    encoder: Encoder
 
 
 xs = [
@@ -370,7 +377,7 @@ xs = [
  'SigLiPFromPatches_0.siglip_encoder.embedding.kernel'
 ]
 
-def _mm_build_shallow_dict(params: FlatDict, *, num_layers: int) -> NestedDict:
+def _build_shallow_dict_multi_modal(params: FlatDict, *, num_layers: int) -> NestedDict:
     """Return a 2-level dict mirroring the NamedTuple but easy to JSON-dump."""
     encoder_prefix = "SigLiPFromPatches_0.siglip_encoder."
     encoderblock_prefix = "SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_"
@@ -465,6 +472,70 @@ def _mm_build_shallow_dict(params: FlatDict, *, num_layers: int) -> NestedDict:
 # Param-to-pytree conversions
 # -----------------------------------------------------------------------------
 
+def _build_model_pytree_multi_modal(params: FlatDict, *, num_layers: int) -> Gemma3MultiModal:
+    """Build a Gemma3MultiModal pytree from a flat parameter dictionary."""
+    encoder_prefix = "SigLiPFromPatches_0.siglip_encoder."
+    encoderblock_prefix = f"{encoder_prefix}Transformer.encoderblock_"
+    num_siglip_layers = 27  # Constant for SigLiP
+
+    def _layer(idx: int) -> Layer:
+        p = f"transformer.layer_{idx}."
+        return Layer(
+            params[p + "attn._key_norm.scale"],
+            params[p + "attn._query_norm.scale"],
+            params[p + "attn.attn_vec_einsum.w"],
+            params[p + "attn.kv_einsum.w"],
+            params[p + "attn.q_einsum.w"],
+            params[p + "mlp.gating_einsum.w"],
+            params[p + "mlp.linear.w"],
+            params[p + "post_attention_norm.scale"],
+            params[p + "post_ffw_norm.scale"],
+            params[p + "pre_attention_norm.scale"],
+            params[p + "pre_ffw_norm.scale"],
+        )
+
+    def _encoder_layer(idx: int) -> EncoderBlock:
+        p = f"{encoderblock_prefix}{idx}."
+        attn_p = p + "MultiHeadDotProductAttention_0."
+        mlp_p = p + "MlpBlock_0."
+        return EncoderBlock(
+            layer_norm_0_bias=params[p + "LayerNorm_0.bias"],
+            layer_norm_0_scale=params[p + "LayerNorm_0.scale"],
+            layer_norm_1_bias=params[p + "LayerNorm_1.bias"],
+            layer_norm_1_scale=params[p + "LayerNorm_1.scale"],
+            mlp_block_0_dense_0_bias=params[mlp_p + "Dense_0.bias"],
+            mlp_block_0_dense_0_kernel=params[mlp_p + "Dense_0.kernel"],
+            mlp_block_0_dense_1_bias=params[mlp_p + "Dense_1.bias"],
+            mlp_block_0_dense_1_kernel=params[mlp_p + "Dense_1.kernel"],
+            key_bias=params[attn_p + "key.bias"],
+            key_kernel=params[attn_p + "key.kernel"],
+            out_bias=params[attn_p + "out.bias"],
+            out_kernel=params[attn_p + "out.kernel"],
+            query_bias=params[attn_p + "query.bias"],
+            query_kernel=params[attn_p + "query.kernel"],
+            value_bias=params[attn_p + "value.bias"],
+            value_kernel=params[attn_p + "value.kernel"],
+        )
+
+    encoder = Encoder(
+        encoder_norm_scale=params[encoder_prefix + "Transformer.encoder_norm.scale"],
+        encoder_norm_bias=params[encoder_prefix + "Transformer.encoder_norm.bias"],
+        pos_embedding=params[encoder_prefix + "pos_embedding"],
+        embedding_bias=params[encoder_prefix + "embedding.bias"],
+        embedding_kernel=params[encoder_prefix + "embedding.kernel"],
+        blocks=tuple(_encoder_layer(i) for i in range(num_siglip_layers)),
+    )
+
+    return Gemma3MultiModal(
+        input_embedding_table=params["transformer.embedder.input_embedding"],
+        mm_input_projection=params["transformer.embedder.mm_input_projection.w"],
+        mm_soft_embedding_norm=params["transformer.embedder.mm_soft_embedding_norm.scale"],
+        final_norm_scale=params["transformer.final_norm.scale"],
+        blocks=tuple(_layer(i) for i in range(num_layers)),
+        encoder=encoder,
+    )
+
+
 def _build_model_pytree(params: FlatDict, *, num_layers: int) -> Gemma3:
     def _layer(idx: int) -> Layer:
         p = f"transformer.layer_{idx}."
@@ -549,6 +620,27 @@ def load_model(path: str | Path, mesh: Mesh, cfg: Config, *, dtype: jnp.dtype | 
     return sharded
 
 
+def old_load_multi_modal_model(path: str | Path, mesh: Mesh, cfg: Config, *, dtype: jnp.dtype | None = None) -> Gemma3MultiModal:
+    """Load multi-modal checkpoint → build NamedTuple → shard → return."""
+    t0 = time.perf_counter()
+    flat = _load_flat_params(path, dtype=dtype, keep_siglip=True)
+    _logger.info("Params loaded in %.2fs", time.perf_counter() - t0)
+
+    model_pt = _build_model_pytree_multi_modal(flat, num_layers=cfg.num_layers)
+    # Note: A corresponding _model_spec_multi_modal would be needed for sharding.
+    # This example proceeds without sharding the vision model for simplicity.
+    # spec_pt = _model_spec_multi_modal(cfg)
+
+    _logger.info("Building multi-modal model...")
+    # Example does not include sharding spec for the vision encoder.
+    # To shard, you would define a Gemma3MultiModalPSpec and use it here.
+    # with mesh:
+    #     sharded = _device_put_with_spec(model_pt, spec_pt, mesh)
+    #     sharded.input_embedding_table.block_until_ready()
+    _logger.info("Done (%.2fs)", time.perf_counter() - t0)
+    return model_pt
+
+
 def load_params(path: str | Path, mesh: Mesh, cfg: Config, *, dtype: jnp.dtype | None = None) -> NestedDict:
     """Load → shallow dict → shard → return."""
     t0 = time.perf_counter()
@@ -593,7 +685,32 @@ def load_unsharded_params(path: str | Path, cfg: Config, *, dtype: jnp.dtype | N
     _logger.info("Done (%.2fs)", time.perf_counter() - t0)
     return nested
 
+def load_multi_modal_model(path: str | Path, mesh: Mesh, cfg: Config, *, dtype: jnp.dtype | None = None) -> Gemma3MultiModal:
+    """Load multi-modal checkpoint → build NamedTuple → shard → return."""
+    t0 = time.perf_counter()
+    flat = _load_flat_params(path, dtype=dtype, keep_siglip=True)
+    _logger.info("Params loaded in %.2fs", time.perf_counter() - t0)
 
+    model_pt = _build_model_pytree_multi_modal(flat, num_layers=cfg.num_layers)
+    spec_pt = _model_spec_multi_modal(cfg)
+
+    _logger.info("Sharding multi-modal model...")
+    t0 = time.perf_counter()
+    with mesh:
+        sharded = _device_put_with_spec(model_pt, spec_pt, mesh)
+        sharded.input_embedding_table.block_until_ready()
+    _logger.info("Done (%.2fs)", time.perf_counter() - t0)
+    return sharded
+
+def load_unsharded_multi_modal_model(path: str | Path, cfg: Config, *, dtype: jnp.dtype | None = None) -> Gemma3MultiModal:
+    """Load multi-modal checkpoint → build NamedTuple → return."""
+    t0 = time.perf_counter()
+    flat = _load_flat_params(path, dtype=dtype, keep_siglip=True)
+    _logger.info("Params loaded in %.2fs", time.perf_counter() - t0)
+
+    model_pt = _build_model_pytree_multi_modal(flat, num_layers=cfg.num_layers)
+    _logger.info("Done (%.2fs)", time.perf_counter() - t0)
+    return model_pt
 
 # -----------------------------------------------------------------------------
 # PartitionSpec templates (NamedTuple PYTree)
@@ -612,7 +729,6 @@ class LayerPSpec(NamedTuple):
     pre_attention_norm_scale: P
     pre_ffw_norm_scale: P
 
-
 class Gemma3PSpec(NamedTuple):
     input_embedding_table: P
     mm_input_projection: P
@@ -620,30 +736,166 @@ class Gemma3PSpec(NamedTuple):
     final_norm_scale: P
     blocks: tuple[LayerPSpec, ...]
 
+class EncoderBlockPSpec(NamedTuple):
+    layer_norm_0_bias: P
+    layer_norm_0_scale: P
+    layer_norm_1_bias: P
+    layer_norm_1_scale: P
+    mlp_block_0_dense_0_bias: P
+    mlp_block_0_dense_0_kernel: P
+    mlp_block_0_dense_1_bias: P
+    mlp_block_0_dense_1_kernel: P
+    key_bias: P
+    key_kernel: P
+    out_bias: P
+    out_kernel: P
+    query_bias: P
+    query_kernel: P
+    value_bias: P
+    value_kernel: P
+
+
+class EncoderPSpec(NamedTuple):
+    encoder_norm_scale: P
+    encoder_norm_bias: P
+    pos_embedding: P
+    embedding_bias: P
+    embedding_kernel: P
+    blocks: tuple[EncoderBlockPSpec, ...]
+
+
+class Gemma3MultiModalPSpec(NamedTuple):
+    input_embedding_table: P
+    mm_input_projection: P
+    mm_soft_embedding_norm: P
+    final_norm_scale: P
+    blocks: tuple[LayerPSpec, ...]
+    encoder: EncoderPSpec
+
 
 # lazy constants
 _norm = P()
 _emb = P(None, "model")
 
 
-def _layer_spec() -> Layer:
-    return Layer(
-        _norm,
-        _norm,
-        P(None, None, "model"),
-        P(None, None, "model", None),
-        P(None, "model", None),
-        P(None, "model", None),
-        P("model", None),
-        _norm,
-        _norm,
-        _norm,
-        _norm,
+def _layer_spec() -> LayerPSpec:
+    return LayerPSpec(
+        attn_key_norm_scale=_norm,
+        attn_query_norm_scale=_norm,
+        output_proj=P(None, None, "model"),
+        kv_proj=P(None, None, "model", None),
+        q_proj=P(None, "model", None),
+        gating_weights=P(None, "model", None),
+        output_weights=P("model", None),
+        post_attention_norm_scale=_norm,
+        post_ffw_norm_scale=_norm,
+        pre_attention_norm_scale=_norm,
+        pre_ffw_norm_scale=_norm,
     )
 
 
-def _model_spec(cfg: Config) -> Gemma3:
-    return Gemma3(_emb, _emb, _norm, _norm, tuple(_layer_spec() for _ in range(cfg.num_layers)))
+def _encoder_block_spec() -> EncoderBlockPSpec:
+    return EncoderBlockPSpec(
+        layer_norm_0_bias=_norm,
+        layer_norm_0_scale=_norm,
+        layer_norm_1_bias=_norm,
+        layer_norm_1_scale=_norm,
+        mlp_block_0_dense_0_bias=_norm,
+        mlp_block_0_dense_0_kernel=P(None, "model"),
+        mlp_block_0_dense_1_bias=_norm,
+        mlp_block_0_dense_1_kernel=P("model", None),
+        key_bias=_norm,
+        key_kernel=P(None, "model", None),
+        out_bias=_norm,
+        out_kernel=P(None, None, "model"),
+        query_bias=_norm,
+        query_kernel=P(None, "model", None),
+        value_bias=_norm,
+        value_kernel=P(None, "model", None),
+    )
+
+
+def _encoder_spec() -> EncoderPSpec:
+    num_siglip_layers = 27  # Constant for SigLiP
+    return EncoderPSpec(
+        encoder_norm_scale=_norm,
+        encoder_norm_bias=_norm,
+        pos_embedding=P(None, None, "model"),
+        embedding_bias=_norm,
+        embedding_kernel=P(None, None, None, "model"),
+        blocks=tuple(_encoder_block_spec() for _ in range(num_siglip_layers)),
+    )
+
+
+def _model_spec(cfg: Config) -> Gemma3PSpec:
+    return Gemma3PSpec(
+        input_embedding_table=_emb,
+        mm_input_projection=_emb,
+        mm_soft_embedding_norm=_norm,
+        final_norm_scale=_norm,
+        blocks=tuple(_layer_spec() for _ in range(cfg.num_layers)),
+    )
+
+
+def _model_spec_multi_modal(cfg: Config) -> Gemma3MultiModalPSpec:
+    """Return the PartitionSpec pytree for the multi-modal model."""
+    gemma3_spec = _model_spec(cfg)
+    encoder_spec = _encoder_spec()
+    return Gemma3MultiModalPSpec(
+        **gemma3_spec._asdict(),
+        encoder=encoder_spec,
+    )
+
+
+# -----------------------------------------------------------------------------
+# PartitionSpec templates (NamedTuple PYTree)
+# -----------------------------------------------------------------------------
+
+# class LayerPSpec(NamedTuple):
+#     attn_key_norm_scale: P
+#     attn_query_norm_scale: P
+#     output_proj: P
+#     kv_proj: P
+#     q_proj: P
+#     gating_weights: P
+#     output_weights: P
+#     post_attention_norm_scale: P
+#     post_ffw_norm_scale: P
+#     pre_attention_norm_scale: P
+#     pre_ffw_norm_scale: P
+
+
+# class Gemma3PSpec(NamedTuple):
+#     input_embedding_table: P
+#     mm_input_projection: P
+#     mm_soft_embedding_norm: P
+#     final_norm_scale: P
+#     blocks: tuple[LayerPSpec, ...]
+
+
+# # lazy constants
+# _norm = P()
+# _emb = P(None, "model")
+
+
+# def _layer_spec() -> Layer:
+#     return Layer(
+#         _norm,
+#         _norm,
+#         P(None, None, "model"),
+#         P(None, None, "model", None),
+#         P(None, "model", None),
+#         P(None, "model", None),
+#         P("model", None),
+#         _norm,
+#         _norm,
+#         _norm,
+#         _norm,
+#     )
+
+
+# def _model_spec(cfg: Config) -> Gemma3:
+#     return Gemma3(_emb, _emb, _norm, _norm, tuple(_layer_spec() for _ in range(cfg.num_layers)))
 
 
 # -----------------------------------------------------------------------------
