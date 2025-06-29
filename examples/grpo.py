@@ -1,18 +1,18 @@
 # %%
-# synthetic_conversations.py
+# synthetic_reasoning_and_tools.py
 import json
 import time
 from functools import partial
-from typing import List, Dict, Tuple
+from typing import List, Any, Dict, Tuple
 import numpy as np
 import jax
 import jax.numpy as jnp
 from pathlib import Path
 import threading
-
 import queue
+import re
 
-# Updated imports for new API
+# Assume setup.py provides these correctly configured components
 from setup import (
     model,
     tokenizer,
@@ -24,13 +24,102 @@ from setup import (
     reset_threading_state,
 )
 
-# Import necessary components for the new API
 from gemma_jax.core.model import forward_fn, decode
 from gemma_jax.core.segment import SegmentInfo
 from gemma_jax.core.cache import KVCache
-from typing import Any
 
-# Queue-based chunked generation globals
+# --- START: New Components for Reasoning and Tool Use ---
+
+# 1. Define Special Tokens and Tool Schema
+# These tags will be used in prompts and parsed from model output.
+THINKING_TAG_START = "<thinking>"
+THINKING_TAG_END = "</thinking>"
+FUNCTION_CALL_TAG_START = "<function_call>"
+FUNCTION_CALL_TAG_END = "</function_call>"
+
+# Define a simple schema for available tools.
+# In a real system, this could be loaded from a config file.
+AVAILABLE_TOOLS = {
+    "calculator": {
+        "description": "A simple calculator for arithmetic operations. Use it for any math calculation.",
+        "usage": "calculator(expression: str)",
+    },
+    "web_search": {
+        "description": "A web search engine. Use it to find up-to-date information or facts about topics, people, and events.",
+        "usage": "web_search(query: str)",
+    }
+}
+
+# 2. Tool Executor Simulation
+# This function simulates the execution of a tool call.
+def tool_executor(function_call_str: str) -> str:
+    """Parses and 'executes' a function call, returning a simulated result."""
+    print(f"[Tool Executor] Received call: {function_call_str}")
+    if function_call_str.startswith("calculator"):
+        try:
+            # A more robust parser would be needed for real use.
+            expr = function_call_str.replace("calculator(", "")[:-1]
+            result = eval(expr, {"__builtins__": {}}, {}) # Safe eval
+            return f"The result of the calculation is {result}."
+        except Exception as e:
+            return f"Error executing calculation: {e}"
+    elif function_call_str.startswith("web_search"):
+        query = function_call_str.replace("web_search(", "")[:-1].strip("'\"")
+        # In a real system, you'd call a search API. Here we simulate it.
+        if "president" in query.lower():
+            return "According to a web search, the current US President is Joe Biden."
+        else:
+            return "According to a web search, information on that topic is available online."
+    else:
+        return "Unknown function call."
+
+# 3. Advanced Metaprompt Generation
+def create_instruction_batch(batch_size: int, rng_seed: int) -> List[str]:
+    """Generates a batch of sophisticated metaprompts to guide the teacher model."""
+    rng = np.random.RandomState(rng_seed)
+    metaprompts = []
+
+    # Define metaprompt templates
+    reasoning_template = """You are an AI data generator. Create a complex question that requires step-by-step reasoning.
+First, provide your thinking process inside <thinking> tags. Then, provide the final answer.
+Question: {question}
+Assistant:"""
+
+    tool_use_template = """You are an AI data generator that can use tools. You have access to the following tools:
+{tools_description}
+To use a tool, output a <function_call> tag with the exact function call.
+Based on the question below, decide if a tool is needed. If so, call it. Otherwise, answer directly.
+Question: {question}
+Assistant:"""
+
+    # Sample questions designed to trigger reasoning or tool use
+    reasoning_questions = [
+        "If a train leaves City A at 8 AM traveling at 60 mph and a car leaves City B (300 miles away) at 9 AM traveling towards City A at 70 mph, at what time will they meet?",
+        "Sarah is twice as old as her brother, Tom. In 5 years, she will be 1.5 times as old as him. How old are they now?",
+    ]
+    tool_use_questions = [
+        "What is (14 * 3) + 98 / 2?",
+        "Who is the current president of the United States?",
+    ]
+
+    for _ in range(batch_size):
+        task_type = rng.choice(["reasoning", "tool_use"])
+        if task_type == "reasoning":
+            question = rng.choice(reasoning_questions)
+            metaprompts.append(reasoning_template.format(question=question))
+        else: # tool_use
+            question = rng.choice(tool_use_questions)
+            tools_desc = "\n".join([f"- {tool}: {details['description']} Usage: {details['usage']}" for tool, details in AVAILABLE_TOOLS.items()])
+            metaprompts.append(tool_use_template.format(question=question, tools_description=tools_desc))
+
+    return metaprompts
+
+# --- END: New Components ---
+
+# --- START: Modified and Existing Code ---
+
+# The consumer and JAX functions remain largely the same, as they operate on token IDs.
+# The core changes are in the Python driver logic.
 _CHUNK_QUEUE = queue.Queue()
 _GENERATION_COMPLETE = threading.Event()
 _CONSUMER_STARTED = threading.Event()
@@ -38,572 +127,361 @@ _EXPECTED_CHUNKS = 0
 _PROCESSED_CHUNKS = 0
 _CHUNKS_LOCK = threading.Lock()
 _consumer_t = None
-
-PAD_ID, EOS_ID, BOS_ID, END_OF_TURN_ID = 0, 1, 2, 106
-
-CONVERSATION_SEEDS = [
-    "Explain quantum computing to a 10-year-old",
-    "Help me debug a Python function that's running slowly",
-    "What are the ethical implications of AI in healthcare?",
-    "Teach me how to make sourdough bread from scratch",
-    "Explain the 2008 financial crisis in simple terms",
-    "How do I optimize my code for better performance?",
-    "What's the difference between machine learning and deep learning?",
-    "Help me plan a sustainable garden for my backyard"
-]
-
-USER_TURN_TEMPLATES = [
-    "Can you explain more about {}?",
-    "What would happen if {}?",
-    "How does this relate to {}?",
-    "Can you give me an example of {}?",
-    "What are the main challenges with {}?",
-    "How would you implement {}?",
-    "What are the alternatives to {}?",
-    "Can you compare this with {}?"
-]
-
-# Global storage for collected tokens
 _COLLECTED_TOKENS = {}
 _TOKENS_LOCK = threading.Lock()
 
+PAD_ID, EOS_ID, BOS_ID, END_OF_TURN_ID = 0, 1, 2, 106
+
 def consumer_thread_with_collection():
-    """Modified consumer thread that collects tokens instead of just printing."""
     global _PROCESSED_CHUNKS, _COLLECTED_TOKENS
     _CONSUMER_STARTED.set()
-    
-    # Reset collected tokens for this generation
     with _TOKENS_LOCK:
         _COLLECTED_TOKENS.clear()
-    
     while True:
-        try:
-            item = _CHUNK_QUEUE.get(timeout=0.1)
+        try: item = _CHUNK_QUEUE.get(timeout=0.1)
         except:
             if _GENERATION_COMPLETE.is_set():
                 with _CHUNKS_LOCK:
-                    if _PROCESSED_CHUNKS >= _EXPECTED_CHUNKS:
-                        break
+                    if _PROCESSED_CHUNKS >= _EXPECTED_CHUNKS: break
             continue
-            
-        if item is None:  # Poison pill
-            break
-            
-        chunk = item["chunk"]  # shape (chunk_size, B)
-        chunk_id = item["chunk_id"]
-        
-        # Store the raw tokens
-        with _TOKENS_LOCK:
-            _COLLECTED_TOKENS[chunk_id] = chunk
-        
-        with _CHUNKS_LOCK:
-            _PROCESSED_CHUNKS += 1
-        
+        if item is None: break
+        with _TOKENS_LOCK: _COLLECTED_TOKENS[item["chunk_id"]] = item["chunk"]
+        with _CHUNKS_LOCK: _PROCESSED_CHUNKS += 1
         _CHUNK_QUEUE.task_done()
-    
     print("[Consumer thread] Exiting.")
 
-# Helper: Build position ids
 def build_positions(mask: jax.Array) -> jax.Array:
     pos = jnp.cumsum(mask, axis=-1)
     return pos - (pos >= 1)
 
-def make_chunk_mask(
-    batch_size: int,
-    start_idx: int,
-    chunk_length: int,
-    cache_length: int,
-) -> jax.Array:
-    """
-    Build a (B, T_chunk, cache_length) causal mask for a chunk length.
-    """
-    q_pos = jnp.arange(chunk_length, dtype=jnp.int32)[:, None] + start_idx
-    k_pos = jnp.arange(cache_length, dtype=jnp.int32)[None, :]
-    mask = k_pos <= q_pos  # (T_chunk, cache_length)
-    mask = jnp.broadcast_to(mask, (batch_size, *mask.shape))
-    return mask
-
 @jax.jit
 def setup_carry(*, state: Any, input_ids: jax.Array, prefill_cache: Any) -> tuple:
-    """Prepare the new SegmentInfo‑based carry."""
-    B         = input_ids.shape[0]
-    seq_lens  = (input_ids != 0).sum(axis=-1)                      # (B,)
-    last_tok  = input_ids[jnp.arange(B), seq_lens - 1]             # (B,)
+    B = input_ids.shape[0]
+    seq_lens = (input_ids != 0).sum(axis=-1)
+    last_tok = input_ids[jnp.arange(B), seq_lens - 1]
+    seg_info = SegmentInfo(lengths=seq_lens, cursor=seq_lens, offset=jnp.zeros_like(seq_lens), cache_len=int(prefill_cache.max_seq_len))
+    return (last_tok, seg_info, 0, prefill_cache, state)
 
-    seg_info = SegmentInfo(
-        lengths=seq_lens,      # tokens already in cache
-        cursor=seq_lens,       # next write slot
-        offset=jnp.zeros_like(seq_lens),
-        cache_len=int(prefill_cache.max_seq_len),
-    )
-
-    carry = (
-        last_tok,              # 0 current input token (B,)
-        seg_info,              # 1 SegmentInfo
-        0,                     # 2 step counter
-        prefill_cache,         # 3 KV‑cache
-        state,                 # 4 model params/state
-    )
-    return carry
-
-# Chunked prefill implementation using static shapes
 @partial(jax.jit, static_argnames=("config", "chunk_length", "cache_length"))
-def chunked_prefill(
-    state: Any,
-    input_ids: jax.Array,  # (B, S_total)
-    model: Any,
-    cache: KVCache,
-    rope_cache: Any,
-    config: Any,
-    *,
-    chunk_length: int,
-    cache_length: int,
-) -> KVCache:
-    """
-    Process an arbitrarily long prompt in fixed-size chunks using static shapes.
-    Returns the filled KV-cache.
-    """
-
+def chunked_prefill(state: Any, input_ids: jax.Array, model: Any, cache: KVCache, rope_cache: Any, config: Any, *, chunk_length: int, cache_length: int) -> KVCache:
     batch_size, seq_len = input_ids.shape
-
     num_chunks = seq_len // chunk_length + (seq_len % chunk_length > 0)
-
-    # Pad tokens to multiple of chunk_length so shapes remain static
     pad_len = num_chunks * chunk_length - seq_len
     padded_input_ids = jnp.pad(input_ids, ((0, 0), (0, pad_len)), constant_values=0)
-
-    # Compute absolute positions
     padded_attn_mask = padded_input_ids != 0
     padded_position_ids = build_positions(padded_attn_mask)
-
-    seq_lens_B = padded_attn_mask.sum(axis=-1)
-
     def body(carry, idx):
         kv_cache, model_state = carry
-
         start = idx * chunk_length
-
-        tok_chunk = jax.lax.dynamic_slice(
-            padded_input_ids, (0, start), (batch_size, chunk_length)
-        )
-        pos_chunk = jax.lax.dynamic_slice(
-            padded_position_ids, (0, start), (batch_size, chunk_length)
-        )
-
+        tok_chunk = jax.lax.dynamic_slice(padded_input_ids, (0, start), (batch_size, chunk_length))
+        pos_chunk = jax.lax.dynamic_slice(padded_position_ids, (0, start), (batch_size, chunk_length))
         write_idx_B = jnp.full((batch_size,), start, dtype=jnp.int32)
-
-        # SegmentInfo describing the cache **before** this chunk is written
-        seg_info = SegmentInfo(
-            lengths=write_idx_B,          # prompt length so far   (B,)
-            cursor=write_idx_B,           # write head starts here (B,)
-            offset=jnp.zeros_like(write_idx_B),
-            cache_len=int(cache_length),
-        )
-
-        _, updated_cache = forward_fn(
-            model_state,
-            tok_chunk,
-            pos_chunk,
-            seg_info,                     # NEW: SegmentInfo instead of attention mask
-            model=model,
-            cache=kv_cache,
-            rope_cache=rope_cache,
-            config=config,
-            auto_regressive=False,
-            mesh=None,                    # keep None – single‑host
-        )
-
+        seg_info = SegmentInfo(lengths=write_idx_B, cursor=write_idx_B, offset=jnp.zeros_like(write_idx_B), cache_len=int(cache_length))
+        _, updated_cache = forward_fn(model_state, tok_chunk, pos_chunk, seg_info, model=model, cache=kv_cache, rope_cache=rope_cache, config=config, auto_regressive=False, mesh=None)
         return (updated_cache, model_state), None
-
     (filled_cache, _), _ = jax.lax.scan(body, (cache, state), jnp.arange(num_chunks))
-
     return filled_cache
 
 @partial(jax.jit, static_argnames=("config"))
-def _generate_one_step(
-    carry,
-    *,
-    model,
-    rope_cache,
-    config,
-):
-    """
-    Single token autoregressive step (jitted) using new SegmentInfo API.
-    """
+def _generate_one_step(carry, *, model, rope_cache, config):
     (cur_tok, seg_info, step, kv_cache, model_state) = carry
-
-    batch   = cur_tok.shape[0]
-    cache_L = config.cache_length
-
-    x_emb, updated_kv_cache = forward_fn(
-        model_state,
-        cur_tok[:, None],
-        seg_info.current_pos[:, None],
-        seg_info,                         # NEW: SegmentInfo instead of attention mask
-        model=model,
-        cache=kv_cache,
-        rope_cache=rope_cache,
-        config=config,
-        auto_regressive=True,
-        mesh=None,
-    )
-
-    logits   = decode(model, x_emb).squeeze(axis=1)          # shape (B,1,V) -> (B, V)
-    next_tok = jnp.argmax(logits, axis=-1).astype(jnp.int32) # shape (B,)
-
-    new_carry = (
-        next_tok,
-        seg_info.advance(1),              # NEW: advance SegmentInfo
-        step + 1,
-        updated_kv_cache,
-        model_state,
-    )
+    x_emb, updated_kv_cache = forward_fn(model_state, cur_tok[:, None], seg_info.current_pos[:, None], seg_info, model=model, cache=kv_cache, rope_cache=rope_cache, config=config, auto_regressive=True, mesh=None)
+    logits = decode(model, x_emb).squeeze(axis=1)
+    next_tok = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    new_carry = (next_tok, seg_info.advance(1), step + 1, updated_kv_cache, model_state)
     return new_carry, next_tok
 
 @partial(jax.jit, static_argnames=("config", "chunk_size", "chunk_id"))
-def paxml_generate_chunked_scan_queue(
-    init_carry,
-    *,
-    model,
-    rope_cache,
-    config,
-    chunk_size: int,
-    chunk_id: int,
-):
-    """
-    Single compiled function that does chunk_size steps in one scan,
-    then returns the entire chunk. Uses new SegmentInfo API.
-    """
-
+def paxml_generate_chunked_scan_queue(init_carry, *, model, rope_cache, config, chunk_size: int, chunk_id: int):
     def step_fn(carry, _):
-        new_carry, next_tok = _generate_one_step(
-            carry,
-            model=model,
-            rope_cache=rope_cache,
-            config=config
-        )
-        return new_carry, next_tok  # shape (B,)
-
-    final_carry, tokens_chunk = jax.lax.scan(
-        step_fn,
-        init_carry,
-        xs=None,
-        length=chunk_size
-    )
-    # tokens_chunk has shape (chunk_size, B)
-
-    # Minimal callback: do a quick device->host copy, then enqueue
+        new_carry, next_tok = _generate_one_step(carry, model=model, rope_cache=rope_cache, config=config)
+        return new_carry, next_tok
+    final_carry, tokens_chunk = jax.lax.scan(step_fn, init_carry, xs=None, length=chunk_size)
     def tap_chunk(dev_chunk):
-        # Quick device->host (use jax.device_get for non-blocking transfer)
-        chunk_host = jax.device_get(dev_chunk)  # shape (chunk_size, B)
-        # Put on a queue for decoding
-        _CHUNK_QUEUE.put({
-            "chunk_id": chunk_id,
-            "chunk": chunk_host
-        })
-
-    # Attach the callback
-    jax.experimental.io_callback(
-            tap_chunk,
-            None,
-            tokens_chunk,
-            ordered=True)
-
+        chunk_host = jax.device_get(dev_chunk)
+        _CHUNK_QUEUE.put({"chunk_id": chunk_id, "chunk": chunk_host})
+    jax.experimental.io_callback(tap_chunk, None, tokens_chunk, ordered=True)
     return final_carry, tokens_chunk
 
-def run_generation_and_collect_tokens(
-    init_carry,
-    *,
-    model,
-    rope_cache,
-    config,
-    total_tokens: int,
-    chunk_size: int
-):
-    """
-    Python driver that calls the chunked scan function (paxml_generate_chunked_scan_queue),repeatedly until 
-    we've generated `total_tokens`,  and collects thems to a list
-
-    Under the hood, it uses a consumer thread to process chunks
-    and collect tokens in order. This allows us to handle large 
-    token generation tasks without running out of memory or
-    blocking the main thread.
-
-    paxml_generate_chunked_scan_queue is a single compiled function that does `chunk_size` steps in one scan,
-    then returns the entire chunk. Minimizes callback overhead:
-    - Just device->host copy
-    - Then put data on a queue for async decode
- 
-    """
+def run_generation_and_collect_tokens(init_carry, *, model, rope_cache, config, total_tokens: int, chunk_size: int):
     global _consumer_t, _EXPECTED_CHUNKS, _PROCESSED_CHUNKS, _COLLECTED_TOKENS
-
-    # Reset counters
     with _CHUNKS_LOCK:
         _PROCESSED_CHUNKS = 0
         _EXPECTED_CHUNKS = (total_tokens + chunk_size - 1) // chunk_size
-
-    # Clear flags
-    _GENERATION_COMPLETE.clear()
-    _CONSUMER_STARTED.clear()
-
-    # Start our modified consumer thread
+    _GENERATION_COMPLETE.clear(); _CONSUMER_STARTED.clear()
     if _consumer_t is None or not _consumer_t.is_alive():
         _consumer_t = threading.Thread(target=consumer_thread_with_collection)
         _consumer_t.start()
-        # Wait for consumer to be ready
         _CONSUMER_STARTED.wait()
-
-    carry = init_carry
-    tokens_left = total_tokens
-    chunk_count = 0
-
+    carry = init_carry; tokens_left = total_tokens; chunk_count = 0
     while tokens_left > 0:
         current_chunk_size = min(tokens_left, chunk_size)
-        carry, chunk_device = paxml_generate_chunked_scan_queue(
-            carry,
-            model=model,
-            rope_cache=rope_cache,
-            config=config,
-            chunk_size=current_chunk_size,
-            chunk_id=chunk_count
-        )
+        carry, _ = paxml_generate_chunked_scan_queue(carry, model=model, rope_cache=rope_cache, config=config, chunk_size=current_chunk_size, chunk_id=chunk_count)
         tokens_left -= current_chunk_size
         chunk_count += 1
-
-    # Signal completion
     _GENERATION_COMPLETE.set()
-
-    # Wait for all chunks to be processed
     print("Waiting for all chunks to be processed...")
     while True:
         with _CHUNKS_LOCK:
-            if _PROCESSED_CHUNKS >= _EXPECTED_CHUNKS:
-                break
+            if _PROCESSED_CHUNKS >= _EXPECTED_CHUNKS: break
         time.sleep(0.01)
-
-    # Collect all tokens in order
     all_tokens = []
     with _TOKENS_LOCK:
         for i in range(chunk_count):
-            if i in _COLLECTED_TOKENS:
-                all_tokens.append(_COLLECTED_TOKENS[i])
-    
-    # Concatenate all chunks
+            if i in _COLLECTED_TOKENS: all_tokens.append(_COLLECTED_TOKENS[i])
     if all_tokens:
-        # Shape: (total_generated, batch)
         concatenated = np.concatenate(all_tokens, axis=0)
-        return carry, concatenated
+        return concatenated
     else:
-        return carry, None
+        return None
 
-def extract_topic_keywords(response: str) -> List[str]:
-    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'between', 'under', 'again', 'further', 'then', 'once'}
-    words = response.lower().split()
-    keywords = [w for w in words if len(w) > 4 and w not in stop_words]
-    return keywords[:5]
-
-def generate_user_turn(previous_response: str, turn_num: int, rng: np.random.RandomState) -> str:
-    if turn_num == 0:
-        return rng.choice(CONVERSATION_SEEDS)
-    
-    keywords = extract_topic_keywords(previous_response)
-    if keywords:
-        template = rng.choice(USER_TURN_TEMPLATES)
-        keyword = rng.choice(keywords)
-        return template.format(keyword)
-    else:
-        followups = [
-            "Tell me more about that",
-            "Can you elaborate?",
-            "What else should I know?",
-            "How does this work in practice?"
-        ]
-        return rng.choice(followups)
-
-def create_conversation_batch(batch_size: int, turn_num: int, previous_responses: List[str], rng_seed: int) -> List[str]:
-    rng = np.random.RandomState(rng_seed + turn_num)
-    user_turns = []
-    
-    for i in range(batch_size):
-        prev_response = previous_responses[i] if previous_responses else ""
-        user_turn = generate_user_turn(prev_response, turn_num, rng)
-        user_turns.append(user_turn)
-    
-    return user_turns
-
-def format_conversation_context(conversation_history: List[Tuple[str, str]]) -> str:
-    formatted = ""
-    for i, (user, assistant) in enumerate(conversation_history):
-        formatted += f"User: {user}\n"
-        formatted += f"Assistant: {assistant}\n"
-    return formatted
-
-def run_multiturn_generation(
-    model,
-    tokenizer,
-    config,
-    state,
-    cache,
-    rope_cache,
-    num_conversations: int = 8,
-    max_turns: int = 4,
-    max_tokens_per_turn: int = 256,
-    temperature: float = 0.8,
-    output_path: str = "conversations.jsonl"
+# MODIFIED: The main generation loop is now more complex to handle tool use.
+def run_reasoning_generation(
+    model, tokenizer, config, state, cache, rope_cache,
+    num_conversations: int = config.batch_size, # 8,
+    max_tokens_per_turn: int = config.generate_steps, # 512, # Increased for reasoning
+    output_path: str = "reasoning_conversations.jsonl"
 ):
+    """Main driver for generating complex reasoning and tool-use data."""
     cache_length = config.cache_length
     chunk_length = config.chunk_length
-    
-    conversations = [[] for _ in range(num_conversations)]
-    previous_responses = [""] * num_conversations
-    
-    for turn in range(max_turns):
-        print(f"\nGenerating turn {turn + 1}/{max_turns}")
-        
-        user_turns = create_conversation_batch(
-            num_conversations, 
-            turn, 
-            previous_responses,
-            rng_seed=42
-        )
-        
-        prompts = []
-        for i, user_turn in enumerate(user_turns):
-            if turn == 0:
-                prompt = f"User: {user_turn}\nAssistant:"
-            else:
-                context = format_conversation_context(conversations[i])
-                prompt = f"{context}User: {user_turn}\nAssistant:"
-            prompts.append(prompt)
-        
-        input_ids = encode_text(prompts, tokenizer, add_special_tokens=True, return_tensors="np")
-        
-        padded_input_ids = np.pad(
-            input_ids, 
-            ((0, 0), (0, cache_length - input_ids.shape[1])), 
-            constant_values=0
-        )
-        jax_input_ids = jnp.array(padded_input_ids, dtype=jnp.int32)
-        
-        t0 = time.time()
-        prefill_cache = chunked_prefill(
-            state=state,
-            input_ids=jax_input_ids,
-            model=model,
-            cache=cache,
-            rope_cache=rope_cache,
-            config=config,
-            chunk_length=chunk_length,
-            cache_length=cache_length,
-        )
-        
-        init_carry = setup_carry(
-            state=state, 
-            input_ids=input_ids, 
-            prefill_cache=prefill_cache
-        )
-        
-        # Use our modified function to collect tokens
-        final_carry, generated_tokens = run_generation_and_collect_tokens(
-            init_carry,
-            model=model,
-            rope_cache=rope_cache,
-            config=config,
-            total_tokens=max_tokens_per_turn,
-            chunk_size=config.chunk_length
-        )
-        
-        # Process generated tokens for each conversation
-        responses = []
-        if generated_tokens is not None:
-            # generated_tokens shape: (total_generated, batch)
-            for i in range(num_conversations):
-                tokens = []
-                for j in range(generated_tokens.shape[0]):
-                    token = int(generated_tokens[j, i])
-                    if token == EOS_ID or token == END_OF_TURN_ID:
-                        break
-                    tokens.append(token)
-                
-                # Decode tokens to text
-                if tokens:
-                    response = tokenizer.decode(tokens)
-                else:
-                    response = ""
-                responses.append(response.strip())
-        else:
-            responses = [""] * num_conversations
-        
-        # Update conversation history
-        for i in range(num_conversations):
-            conversations[i].append((user_turns[i], responses[i]))
-            previous_responses[i] = responses[i]
-        
-        print(f"Turn {turn + 1} completed in {time.time() - t0:.2f}s")
-        
-        # Print sample conversation
-        if responses[0]:
-            print(f"Sample response: {responses[0][:100]}...")
-    
-    # Save conversations with correct format
-    with open(output_path, 'w') as f:
-        for conv in conversations:
-            conv_data = {
-                "conversation": [],
-                "num_turns": len(conv)
-            }
-            
-            # Build conversation with alternating user/assistant messages
-            for user_msg, assistant_msg in conv:
-                conv_data["conversation"].append({
-                    "role": "user", 
-                    "content": user_msg
-                })
-                conv_data["conversation"].append({
-                    "role": "assistant", 
-                    "content": assistant_msg
-                })
-            
-            f.write(json.dumps(conv_data) + '\n')
-    
-    print(f"\nSaved {num_conversations} conversations to {output_path}")
-    return conversations
 
+    # Store full conversation history as list of message dicts
+    conversations_history = [[{"role": "system", "content": "You are a helpful AI assistant."}] for _ in range(num_conversations)]
+
+    print(f"\nGenerating {num_conversations} complex conversations...")
+
+    # Generate the initial metaprompts
+    initial_prompts = create_instruction_batch(num_conversations, rng_seed=42)
+
+    # Prepare prompts for the model
+    # The full conversation history is formatted for the model at each step.
+    prompts_for_model = [
+        tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False) + f"\nUser: {initial_prompts[i]}\nAssistant:"
+        for i, conv in enumerate(conversations_history)
+    ]
+
+    for i in range(num_conversations):
+        conversations_history[i].append({"role": "user", "content": initial_prompts[i]})
+
+    while True: # Loop until all conversations are complete
+        # Encode and prefill
+        input_ids = encode_text(prompts_for_model, tokenizer, add_special_tokens=False, return_tensors="np")
+        prefill_cache = chunked_prefill(
+            state, input_ids, model, cache, rope_cache, config,
+            chunk_length=chunk_length, cache_length=cache_length
+        )
+        init_carry = setup_carry(state=state, input_ids=input_ids, prefill_cache=prefill_cache)
+
+        # Generate the next turn from the model
+        generated_tokens = run_generation_and_collect_tokens(
+            init_carry, model=model, rope_cache=rope_cache, config=config,
+            total_tokens=max_tokens_per_turn, chunk_size=chunk_length
+        )
+
+        if generated_tokens is None:
+            print("Generation finished for all conversations.")
+            break
+
+        needs_another_turn = [False] * num_conversations
+        next_prompts_for_model = [""] * num_conversations
+
+        # Process the output for each conversation in the batch
+        for i in range(num_conversations):
+            tokens = [int(t) for t in generated_tokens[:, i] if t not in [PAD_ID, EOS_ID, END_OF_TURN_ID]]
+            response = tokenizer.decode(tokens).strip()
+
+            # The core logic for handling different response types
+            if FUNCTION_CALL_TAG_START in response:
+                # 1. It's a tool call
+                match = re.search(f"{re.escape(FUNCTION_CALL_TAG_START)}(.*?){re.escape(FUNCTION_CALL_TAG_END)}", response, re.DOTALL)
+                function_call = match.group(1).strip()
+                tool_output = tool_executor(function_call)
+
+                # Append the tool call and tool output to the history
+                conversations_history[i].append({"role": "assistant", "content": f"{FUNCTION_CALL_TAG_START}{function_call}{FUNCTION_CALL_TAG_END}"})
+                conversations_history[i].append({"role": "tool", "content": tool_output})
+
+                # We need to call the model again with the tool's result
+                needs_another_turn[i] = True
+                next_prompts_for_model[i] = tokenizer.apply_chat_template(conversations_history[i], tokenize=False, add_generation_prompt=True)
+
+            else:
+                # 2. It's a standard response (potentially with thinking)
+                conversations_history[i].append({"role": "assistant", "content": response})
+                # This conversation is done for this "macro" turn.
+                needs_another_turn[i] = False
+
+        # If no conversation needs another turn, we are done
+        if not any(needs_another_turn):
+            break
+        else:
+            # Otherwise, update the prompts for the conversations that need to continue
+            prompts_for_model = next_prompts_for_model
+            print("Some conversations require a tool-use follow-up. Continuing...")
+
+    # Save the completed, rich conversations
+    with open(output_path, 'w') as f:
+        for conv_history in conversations_history:
+            # We remove the initial system prompt for cleaner data, but it can be kept.
+            final_data = {"messages": conv_history[1:]}
+            f.write(json.dumps(final_data) + '\n')
+
+    print(f"\nSaved {num_conversations} complex conversations to {output_path}")
+    return conversations_history
+
+
+# --- START: Enhanced RL / Advanced Reasoning Components ---
+
+# Function to generate multiple outputs per input
+# Useful for reinforcement learning, sampling, or reasoning analysis.
+def generate_multiple_outputs(
+    input_prompt: str,
+    model, tokenizer, config, state, cache, rope_cache,
+    num_outputs: int = 5,
+    max_tokens_per_output: int = 256
+) -> List[Dict[str, Any]]:
+    """Generates multiple outputs for a single input prompt."""
+    outputs = []
+    input_ids = encode_text(
+        [input_prompt] * num_outputs,
+        tokenizer,
+        add_special_tokens=False,
+        return_tensors="np"
+    )
+
+    prefill_cache = chunked_prefill(
+        state, input_ids, model, cache, rope_cache, config,
+        chunk_length=config.chunk_length,
+        cache_length=config.cache_length
+    )
+
+    init_carry = setup_carry(
+        state=state,
+        input_ids=input_ids,
+        prefill_cache=prefill_cache
+    )
+
+    generated_tokens = run_generation_and_collect_tokens(
+        init_carry,
+        model=model,
+        rope_cache=rope_cache,
+        config=config,
+        total_tokens=max_tokens_per_output,
+        chunk_size=config.chunk_length
+    )
+
+    if generated_tokens is None:
+        return []
+
+    for i in range(num_outputs):
+        tokens = [int(t) for t in generated_tokens[:, i] if t not in [PAD_ID, EOS_ID, END_OF_TURN_ID]]
+        response = tokenizer.decode(tokens).strip()
+        outputs.append({
+            "output_index": i,
+            "response": response
+        })
+
+    return outputs
+
+# Example reinforcement-learning-like usage
+# Generate multiple outputs and select or evaluate them based on custom criteria
+
+def evaluate_outputs(outputs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Evaluates multiple generated outputs and returns the best one based on custom criteria."""
+    # Placeholder evaluation: here we use simple length-based heuristic
+    best_output = max(outputs, key=lambda x: len(x['response']))
+    return best_output
+
+# --- Example of Using Advanced Generation ---
+
+def run_advanced_reasoning_generation(
+    model, tokenizer, config, state, cache, rope_cache,
+    input_prompts: List[str],
+    num_outputs_per_input: int = 5,
+    max_tokens_per_output: int = config.generate_steps
+):
+    all_results = []
+
+    for prompt in input_prompts:
+        generated_outputs = generate_multiple_outputs(
+            prompt,
+            model,
+            tokenizer,
+            config,
+            state,
+            cache,
+            rope_cache,
+            num_outputs=num_outputs_per_input,
+            max_tokens_per_output=max_tokens_per_output
+        )
+
+        best_output = evaluate_outputs(generated_outputs)
+        reasoning_trace = {
+            "prompt": prompt,
+            "generated_outputs": generated_outputs,
+            "selected_output": best_output
+        }
+
+        all_results.append(reasoning_trace)
+        print(f"Prompt: {prompt}\nSelected Output: {best_output['response']}\n")
+
+    # Save results
+    with open("advanced_reasoning_traces.jsonl", "w") as f:
+        for trace in all_results:
+            f.write(json.dumps(trace) + '\n')
+
+    return all_results
+
+# --- Example execution ---
 if __name__ == "__main__":
-    # Reset threading state to avoid conflicts from setup.py import
     reset_threading_state()
-    
-    conversations = run_multiturn_generation(
+
+    input_prompts = [
+        "Explain how gravity affects ocean tides in detail.",
+        "Calculate the volume of a cylinder with radius 5 and height 10."
+    ]
+
+    advanced_traces = run_advanced_reasoning_generation(
         model=model,
         tokenizer=tokenizer,
         config=config,
         state=state,
         cache=cache,
         rope_cache=rope_cache,
-        num_conversations=config.batch_size, # num_conversations must equal batch size
-        max_turns=2,
-        max_tokens_per_turn=config.generate_steps,
-        temperature=0.8,
-        output_path="synthetic_conversations.jsonl"
+        input_prompts=input_prompts,
+        num_outputs_per_input=config.batch_size,
+        max_tokens_per_output=config.generate_steps
     )
 
-    # Clean shutdown
     if _consumer_t and _consumer_t.is_alive():
-        # Send poison pill to stop consumer thread
         _CHUNK_QUEUE.put(None)
-        # Wait for thread to finish
         _consumer_t.join(timeout=1.0)
-        if _consumer_t.is_alive():
-            print("Warning: Consumer thread did not exit cleanly")
 
-    print("Script completed successfully!")
-    
-    # Print first conversation as example
-    if conversations and conversations[0]:
-        print("\nExample conversation:")
-        for turn_idx, (user, assistant) in enumerate(conversations[0]):
-            print(f"\nTurn {turn_idx + 1}:")
-            print(f"User: {user}")
-            print(f"Assistant: {assistant}")
+    # Print the first advanced reasoning trace
+    print("\n--- Example Advanced Reasoning Trace ---")
+    print(json.dumps(advanced_traces[0], indent=2))
 
-# %%
+
+'''
+if __name__ == "__main__":
+    reset_threading_state()
+
+    final_conversations = run_reasoning_generation(
+        model=model, tokenizer=tokenizer, config=config, state=state,
+        cache=cache, rope_cache=rope_cache,
+        num_conversations=config.batch_size,
+        max_tokens_per_turn=config.generate_steps,
+        output_path="synthetic_reasoning_conversations.jsonl"
+    )
+
+    if _consumer_t and _consumer_t.is_alive():
+        _CHUNK_QUEUE.put(None)
+        _consumer_t.join(timeout=1.0)
+
+    print("\n--- Example Generated Conversation ---")
+    if final_conversations:
+        # Using a nice format for printing the first conversation
+        print(json.dumps(final_conversations[0], indent=2))
+
+'''

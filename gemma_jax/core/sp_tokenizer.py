@@ -7,12 +7,13 @@ Supports:
     - explicit bos_token_id handling (default 2)
     - uses EncodeAsIds / DecodeIds directly to avoid slow Python paths
     - preserves the Gemma whitespace sentinel when ingesting pre-split tokens
+    - NEW: Includes `apply_chat_template` for formatting conversational data.
 
 Based on examples from: https://github.com/google-deepmind/gemma/tree/main/gemma/gm/text
 """
 
 from pathlib import Path
-from typing import Any, Union, Sequence, Iterable
+from typing import Any, Union, Sequence, Iterable, List, Dict
 
 import jax
 import jax.numpy as jnp
@@ -21,19 +22,25 @@ import numpy as np
 import sentencepiece as spm
 from typing import Optional
 
-# --- Remaining processing functions ---
-PAD_ID = 0
-EOS_ID = 1
-BOS_ID = 2
-START_OF_TURN_ID = 105
-END_OF_TURN_ID = 106
+# Refactored:
+# START_OF_TURN_ID = 105
+# END_OF_TURN_ID = 106
 
 # --- Dialogue prompt/ answer wrappers ---
 PROMPT_TEMPLATE = "<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n"
 ANSWER_TEMPLATE = "{}<end_of_turn>"
 
+# --- Remaining processing functions ---
+PAD_ID = 0
+EOS_ID = 1
+BOS_ID = 2
+# Note: Gemma uses specific tokens for turns, not just string templates.
+USER_TURN_START = "<start_of_turn>user\n"
+MODEL_TURN_START = "<start_of_turn>model\n"
+TURN_END = "<end_of_turn>"
+
 # Unicode U+2581 "Lower One Eighth Block" used by SentencePiece to mark spaces.
-_WHITESPACE_CHAR = "▁"
+_WHITESPACE_CHAR = " "
 
 __all__ = ["SentencePieceTokenizer"]
 
@@ -58,6 +65,87 @@ class SentencePieceTokenizer:
     self.pad_token_id = pad_token_id
     self.eos_token_id = eos_token_id
     self.bos_token_id = bos_token_id
+
+  # --- START: NEW apply_chat_template method ---
+
+  def apply_chat_template(
+      self,
+      conversation: List[Dict[str, str]],
+      *,
+      tokenize: bool = True,
+      add_generation_prompt: bool = True,
+      add_bos_token: bool = True,
+      add_eos_token: bool = False, # Usually False for generation
+  ) -> Union[str, List[int]]:
+      """
+      Formats a list of message dictionaries into a single string or list of token IDs,
+      following the Gemma chat format.
+
+      Args:
+          conversation: A list of dictionaries, where each dictionary has a "role"
+                        (e.g., "user", "assistant") and a "content" key.
+          tokenize: If True, returns token IDs. If False, returns a formatted string.
+          add_generation_prompt: If True, adds the start-of-turn sequence for the
+                                 assistant at the end, prompting it to respond.
+          add_bos_token: Whether to prepend the BOS token. Gemma models require this.
+          add_eos_token: Whether to append the EOS token. Usually not done for generation.
+
+      Returns:
+          A formatted string or a list of integer token IDs.
+      """
+      formatted_string = ""
+
+      # Prepend BOS token if requested
+      if add_bos_token and self.bos_token_id is not None:
+          # Use a non-string representation to avoid tokenizing the token itself
+          # In string form, we just add a placeholder or handle it during tokenization.
+          # For direct tokenization, we'll prepend the ID later.
+          pass # We will handle this during tokenization to be safe.
+
+      for message in conversation:
+          role = message.get("role")
+          content = message.get("content")
+
+          if role == "user":
+              formatted_string += f"{USER_TURN_START}{content}{TURN_END}\n"
+          elif role == "assistant" or role == "model": # Accept both "assistant" and "model" roles
+              formatted_string += f"{MODEL_TURN_START}{content}{TURN_END}\n"
+          elif role == "system":
+              # Gemma chat format doesn't have a distinct system role delimiter like other models.
+              # It's usually prepended to the first user message. For simplicity here,
+              # we will just treat it as part of the first turn's content.
+              # A more robust implementation might handle this differently.
+              # Here we prepend it directly.
+              formatted_string = f"{content}\n" + formatted_string
+          else:
+              # For tool calls or other custom roles, you might add more logic.
+              # For now, we'll just format them plainly.
+              formatted_string += f"<start_of_turn>{role}\n{content}{TURN_END}\n"
+
+      if add_generation_prompt:
+          formatted_string += MODEL_TURN_START
+
+      if not tokenize:
+          # If we need the string, prepend the BOS token now if it exists as a string.
+          # The Gemma tokenizer.model knows how to handle <bos>.
+          # However, a pure string approach might be ambiguous.
+          # Best practice is to handle special tokens during tokenization.
+          # For this implementation, we will assume string output is for human-readability
+          # and tokenized output is for the model.
+          return formatted_string
+
+      # --- Tokenization Logic ---
+      token_ids = self.sp.EncodeAsIds(formatted_string)
+
+      if add_bos_token and self.bos_token_id is not None:
+          token_ids = [self.bos_token_id] + token_ids
+
+      if add_eos_token and self.eos_token_id is not None:
+          token_ids = token_ids + [self.eos_token_id]
+
+      return token_ids
+
+  # --- END: NEW apply_chat_template method ---
 
   # Encoding helpers
   def encode(
@@ -113,7 +201,16 @@ class SentencePieceTokenizer:
       **__,
   ) -> str:
     if skip_special_tokens:
-      ids = [i for i in ids if i not in (self.pad_token_id, self.eos_token_id, self.bos_token_id)]
+        # Also remove the turn delimiters for cleaner output
+        special_ids_to_skip = {
+            self.pad_token_id,
+            self.eos_token_id,
+            self.bos_token_id,
+            # Let's get the token IDs for the turn delimiters from the processor
+            self.sp.piece_to_id("<start_of_turn>"),
+            self.sp.piece_to_id("<end_of_turn>")
+        }
+        ids = [i for i in ids if i not in special_ids_to_skip]
     return self.sp.DecodeIds(ids)
 
   def batch_decode(
@@ -177,6 +274,7 @@ class SentencePieceTokenizer:
     if not Path(model_path).exists():
       raise FileNotFoundError(model_path)
     return cls(model_path, **kwargs)
+
 
 
 # --- Dialogue prompt/ answer wrappers ---
@@ -402,3 +500,4 @@ def encode_raw_ids(
   return input_ids, position_ids, attn_mask, causal_attn
 
 # %%
+
