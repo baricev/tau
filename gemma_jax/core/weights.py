@@ -257,7 +257,6 @@ def create_device_mesh(shape: tuple[int | None, int | None] | None = None, *, ax
 def _restore_ckpt(path: str | Path):
     return ocp.PyTreeCheckpointer().restore(str(path))
 
-
 def _load_flat_params(path: str | Path, *, dtype: jnp.dtype | None = None, keep_siglip: bool = False) -> FlatDict:
     _logger.info("Reading checkpoint %s", path)
     raw = _restore_ckpt(path)
@@ -273,6 +272,54 @@ def _load_flat_params(path: str | Path, *, dtype: jnp.dtype | None = None, keep_
 # -----------------------------------------------------------------------------
 
 # fmt: off
+#  'LayerNorm_0.bias',
+#  'LayerNorm_0.scale',
+#  'LayerNorm_1.bias',
+#  'LayerNorm_1.scale',
+#  'MlpBlock_0.Dense_0.bias',
+#  'MlpBlock_0.Dense_0.kernel',
+#  'MlpBlock_0.Dense_1.bias',
+#  'MlpBlock_0.Dense_1.kernel',
+#  'MultiHeadDotProductAttention_0.key.bias',
+#  'MultiHeadDotProductAttention_0.key.kernel',
+#  'MultiHeadDotProductAttention_0.out.bias',
+#  'MultiHeadDotProductAttention_0.out.kernel',
+#  'MultiHeadDotProductAttention_0.query.bias',
+#  'MultiHeadDotProductAttention_0.query.kernel',
+#  'MultiHeadDotProductAttention_0.value.bias',
+#  'MultiHeadDotProductAttention_0.value.kernel',
+#  ]
+
+class EncoderBlock(NamedTuple):
+    layer_norm_0_bias          : Array   # (embed_dim,)                             (D,)
+    layer_norm_0_scale         : Array   # (embed_dim,)                             (D,)
+    layer_norm_1_bias          : Array   # (embed_dim,)                             (D,)
+    layer_norm_1_scale         : Array   # (embed_dim,)                             (D,)
+
+    mlp_block_0_dense_0_bias   : Array   # (mlp_hidden_dim,)                        (F,)
+    mlp_block_0_dense_0_kernel : Array   # (embed_dim, mlp_hidden_dim)              (D,F)
+    mlp_block_0_dense_1_bias   : Array   # (embed_dim,)                             (D,)
+    mlp_block_0_dense_1_kernel : Array   # (mlp_hidden_dim, embed_dim)              (F,D)
+
+    key_bias: Array                      # (num_kv_heads, head_dim)                 (K,H)
+    key_kernel: Array                    # (embed_dim, num_kv_heads, head_dim)      (D,K,H)
+    out_bias: Array                      # (embed_dim,)                             (D,)
+    out_kernel: Array                    # (num_heads, head_dim, embed_dim)         (N,H,D)
+    query_bias: Array                    # (num_heads, head_dim)                    (N,H)
+    query_kernel: Array                  # (embed_dim, num_heads, head_dim)         (D,N,H)
+    value_bias: Array                    # (num_heads, head_dim)                    (N,H)
+    value_kernel: Array                  # (embed_dim, num_heads, head_dim)         (D,N,H)     
+
+
+class Embedder(NamedTuple):
+    encoder_norm_scale          : Array   # (embed_dim,)                            (D,)
+    encoder_norm_bias           : Array   # (embed_dim,)                            (D,)
+    pos_embedding               : Array   # (1, max_seq_len, embed_dim)  # (1,S,D)
+    embedding_bias              : Array   # (embed_dim,)                            (D,)
+    embedding_kernel            : Array   # (patch_size, patch_size, in_channels, embed_dim)  # (P,P,C,D)
+    # SigLiP encoder params
+    blocks                      :  tuple[EncoderBlock, ...]
+
 class Layer(NamedTuple):
     attn_key_norm_scale         :  Array   # (head_dim,)                             (H,)
     attn_query_norm_scale       :  Array   # (head_dim,)                             (H,)
@@ -294,6 +341,125 @@ class Gemma3(NamedTuple):
     final_norm_scale             :  Array   # (embed_dim,)                            (D,)
     blocks                      :  tuple[Layer, ...]
 # fmt: on
+
+
+
+
+xs = [
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.LayerNorm_0.bias',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.LayerNorm_0.scale',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.LayerNorm_1.bias',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.LayerNorm_1.scale',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MlpBlock_0.Dense_0.bias',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MlpBlock_0.Dense_0.kernel',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MlpBlock_0.Dense_1.bias',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MlpBlock_0.Dense_1.kernel',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.key.bias',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.key.kernel',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.out.bias',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.out.kernel',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.query.bias',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.query.kernel',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.value.bias',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.value.kernel',
+
+ 'SigLiPFromPatches_0.siglip_encoder.pos_embedding',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoder_norm.bias',
+ 'SigLiPFromPatches_0.siglip_encoder.Transformer.encoder_norm.scale',
+ 'SigLiPFromPatches_0.siglip_encoder.embedding.bias',
+ 'SigLiPFromPatches_0.siglip_encoder.embedding.kernel'
+]
+
+def _mm_build_shallow_dict(params: FlatDict, *, num_layers: int) -> NestedDict:
+    """Return a 2-level dict mirroring the NamedTuple but easy to JSON-dump."""
+    encoder_prefix = "SigLiPFromPatches_0.siglip_encoder."
+    encoderblock_prefix = "SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_"
+    out: NestedDict = {
+        "input_embedding_table"         : params["transformer.embedder.input_embedding"],
+        "mm_input_projection"           : params["transformer.embedder.mm_input_projection.w"],
+        "mm_soft_embedding_norm"        : params["transformer.embedder.mm_soft_embedding_norm.scale"],
+        "final_norm_scale"               : params["transformer.final_norm.scale"],
+        "blocks"                        : [],
+        "encoder": {
+            "encoder_norm_scale"           : params[encoder_prefix + "Transformer.encoder_norm.scale"],
+            "encoder_norm_bias"            : params[encoder_prefix + "Transformer.encoder_norm.bias"],
+            "pos_embedding"                : params[encoder_prefix + "pos_embedding"],
+            "embedding_bias"               : params[encoder_prefix + "embedding.bias"],
+            "embedding_kernel"             : params[encoder_prefix + "embedding.kernel"],
+            "blocks": []
+        } 
+    }
+    for i in range(num_layers):
+        p = f"transformer.layer_{i}."
+        out["blocks"].append({
+            "attn_key_norm_scale"       : params[p + "attn._key_norm.scale"],
+            "attn_query_norm_scale"     : params[p + "attn._query_norm.scale"],
+            "output_proj"               : params[p + "attn.attn_vec_einsum.w"],
+            "kv_proj"                   : params[p + "attn.kv_einsum.w"],
+            "q_proj"                    : params[p + "attn.q_einsum.w"],
+            "gating_weights"            : params[p + "mlp.gating_einsum.w"],
+            "output_weights"            : params[p + "mlp.linear.w"],
+            "post_attention_norm_scale" : params[p + "post_attention_norm.scale"],
+            "post_ffw_norm_scale"       : params[p + "post_ffw_norm.scale"],
+            "pre_attention_norm_scale"  : params[p + "pre_attention_norm.scale"],
+            "pre_ffw_norm_scale"        : params[p + "pre_ffw_norm.scale"],
+        })
+
+    # Add SigLiP encoder params 
+    num_siglip_layers = 27  # Constant for SigLiP
+    for i in range(num_siglip_layers):
+        p = f"{encoderblock_prefix}{i}."
+        out["encoder"]["blocks"].append({
+            "LayerNorm_0_bias"         : params[p + "LayerNorm_0.bias"],
+            "LayerNorm_0_scale"        : params[p + "LayerNorm_0.scale"],
+            "LayerNorm_1_bias"         : params[p + "LayerNorm_1.bias"],
+            "LayerNorm_1_scale"        : params[p + "LayerNorm_1.scale"],
+            "MlpBlock_0_Dense_0_bias"  : params[p + "MlpBlock_0.Dense_0.bias"],
+            "MlpBlock_0_Dense_0_kernel": params[p + "MlpBlock_0.Dense_0.kernel"],
+            "MlpBlock_0_Dense_1_bias"  : params[p + "MlpBlock_0.Dense_1.bias"],
+            "MlpBlock_0_Dense_1_kernel": params[p + "MlpBlock_0.Dense_1.kernel"],
+            "MultiHeadDotProductAttention_0_key_bias": params[p + "MultiHeadDotProductAttention_0.key.bias"],
+            "MultiHeadDotProductAttention_0_key_kernel": params[p + "MultiHeadDotProductAttention_0.key.kernel"],
+            "MultiHeadDotProductAttention_0_out_bias": params[p + "MultiHeadDotProductAttention_0.out.bias"],
+            "MultiHeadDotProductAttention_0_out_kernel": params[p + "MultiHeadDotProductAttention_0.out.kernel"],
+            "MultiHeadDotProductAttention_0_query_bias": params[p + "MultiHeadDotProductAttention_0.query.bias"],
+            "MultiHeadDotProductAttention_0_query_kernel": params[p + "MultiHeadDotProductAttention_0.query.kernel"],
+            "MultiHeadDotProductAttention_0_value_bias": params[p + "MultiHeadDotProductAttention_0.value.bias"],
+            "MultiHeadDotProductAttention_0_value_kernel": params[p + "MultiHeadDotProductAttention_0.value.kernel"],
+        })
+
+    return out
+# fmt: on
+
+
+# params = _load_flat_params(CHECKPOINT_PATH.as_posix(), dtype=jnp.bfloat16, keep_siglip=True)
+# siglip_keys = [k for k in params.keys() if not k.startswith('transformer')]
+# for k in xs: print(f"{k:<110} {str(params[k].shape)}")
+
+
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.LayerNorm_0.bias                                 (1152,)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.LayerNorm_0.scale                                (1152,)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.LayerNorm_1.bias                                 (1152,)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.LayerNorm_1.scale                                (1152,)
+
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MlpBlock_0.Dense_0.bias                          (4304,)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MlpBlock_0.Dense_0.kernel                        (1152, 4304)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MlpBlock_0.Dense_1.bias                          (1152,)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MlpBlock_0.Dense_1.kernel                        (4304, 1152)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.key.bias          (16, 72)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.key.kernel        (1152, 16, 72)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.out.bias          (1152,)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.out.kernel        (16, 72, 1152)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.query.bias        (16, 72)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.query.kernel      (1152, 16, 72)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.value.bias        (16, 72)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoderblock_0.MultiHeadDotProductAttention_0.value.kernel      (1152, 16, 72)
+# SigLiPFromPatches_0.siglip_encoder.pos_embedding                                                               (1, 4096, 1152)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoder_norm.bias                                               (1152,)
+# SigLiPFromPatches_0.siglip_encoder.Transformer.encoder_norm.scale                                              (1152,)
+# SigLiPFromPatches_0.siglip_encoder.embedding.bias                                                              (1152,)
+# SigLiPFromPatches_0.siglip_encoder.embedding.kernel                                                            (14, 14, 3, 1152)
+
 
 # -----------------------------------------------------------------------------
 # Param-to-pytree conversions
