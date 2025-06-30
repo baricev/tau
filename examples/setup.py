@@ -1,4 +1,4 @@
-# %% 
+# %%
 # setup.py
 
 import argparse
@@ -87,7 +87,7 @@ def _parse_arguments():
     parser.add_argument(
         '--use_multi_modal',
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Use the multi-modal model. Default is True. Use --no-use-multi-modal to disable."
     )
 
@@ -181,7 +181,7 @@ print(f"Checkpoint path: {CHECKPOINT_PATH}")
 # %%
 # !pip install -e . --quiet
 
-# %% 
+# %%
 
 # If running in Colab, mount the drive and clone the gemma-jax repository (uncomment the lines below)
 
@@ -204,15 +204,15 @@ print(f"Checkpoint path: {CHECKPOINT_PATH}")
 # %% [markdown]
 #
 # ### Running the script directly from a Notebook (Colab or VS Code)
-#  
+#
 # See commented out lines below for example commands
-# %%  
+# %%
 # Colab:
 # !python examples/multi_turn_chat.py --tokenizer_path /content/tau/tokenizer.model --checkpoint_path /content/drive/MyDrive/4b
-# 
+#
 # VS Code:
 # !python multi_turn_chat.py --tokenizer_path  /Users/v/new_workspace/baricev-gemma-jax-final-june-26/tokenizer.model
-# 
+#
 
 # %% [markdown]
 # ### Model Loading
@@ -313,13 +313,13 @@ generate_steps = 1024  # Number of tokens generated after prefill
 # %% [markdown]
 # ### Initialization and Model Loading
 #
-# This step includes initializing the device mesh, loading the Gemma model checkpoint, creating RoPE caches, initializing KV caches, and loading the tokenizer. 
+# This step includes initializing the device mesh, loading the Gemma model checkpoint, creating RoPE caches, initializing KV caches, and loading the tokenizer.
 # It dynamically adjusts settings based on the detected hardware (CPU or TPU).
 
 if jax.devices()[0].device_kind == "cpu":
   print("Using CPU device settings.")
   cache_length, chunk_length, window_size,  batch, generate_steps = 128, 128, 128, 2, 8
-  cache_length, chunk_length, window_size,  batch, generate_steps = 1*1024, 128, 1024, 4, 32 
+  cache_length, chunk_length, window_size,  batch, generate_steps = 1*1024, 128, 1024, 4, 32
   shard_model = False # True for TPU, False for CPU
   # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1"
 else:
@@ -552,7 +552,7 @@ def consumer_thread(tokenizer_arg):
     """Consumer thread that processes chunks from the queue."""
     global _PROCESSED_CHUNKS
     _CONSUMER_STARTED.set()
-    
+
     while True:
         try:
             # Use timeout to periodically check if we should exit
@@ -564,26 +564,26 @@ def consumer_thread(tokenizer_arg):
                     if _PROCESSED_CHUNKS >= _EXPECTED_CHUNKS:
                         break
             continue
-            
+
         if item is None:  # Poison pill
             break
-            
+
         chunk = item["chunk"]  # shape (chunk_size, B)
         chunk_id = item["chunk_id"]
-        
+
         # Decode the chunk
         batch_size = chunk.shape[1]
         unpermuted = chunk.reshape(-1, batch_size).transpose(1, 0)
         text = tokenizer_arg.batch_decode(unpermuted)
-        
+
         print(f"[Consumer thread] chunk {chunk_id}, text='{text}'")
-        
+
         with _CHUNKS_LOCK:
             _PROCESSED_CHUNKS += 1
-        
+
         # Mark task as done
         _CHUNK_QUEUE.task_done()
-    
+
     print("[Consumer thread] Exiting.")
 
 
@@ -652,12 +652,12 @@ def paxml_generate_chunked_scan_queue(
 def reset_threading_state():
     """Reset threading state to avoid conflicts between multiple imports."""
     global _consumer_t, _EXPECTED_CHUNKS, _PROCESSED_CHUNKS
-    
+
     # Clean up existing thread if running
     if _consumer_t and _consumer_t.is_alive():
         _CHUNK_QUEUE.put(None)  # Poison pill
         _consumer_t.join(timeout=1.0)
-    
+
     # Reset state
     _consumer_t = None
     _GENERATION_COMPLETE.clear()
@@ -665,7 +665,7 @@ def reset_threading_state():
     with _CHUNKS_LOCK:
         _PROCESSED_CHUNKS = 0
         _EXPECTED_CHUNKS = 0
-    
+
     # Clear queue
     while not _CHUNK_QUEUE.empty():
         try:

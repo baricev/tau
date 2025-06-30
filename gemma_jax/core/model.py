@@ -30,27 +30,72 @@ from gemma_jax.core.ragged_attention import ragged_gqa as _ragged_gqa
 # Transformer class
 # -----------------------------------------------------------------------------
 
+# for SigLiP:
+# S = 4096 , E = 1152, M = 4304   (max_seq_len, ViT_embed_dim, mlp_hidden_dim)
+# P = 14, C = 3         (patch_size, in_channels)
+# vN = 16, vH = 72      (ViT_num_kv_heads, ViT_head_dim)
+
+# fmt: on
+class EncoderBlock(NamedTuple):
+    layer_norm_0_bias          : Array   # (embed_dim,)                             (E,)
+    layer_norm_0_scale         : Array   # (embed_dim,)                             (E,)
+    layer_norm_1_bias          : Array   # (embed_dim,)                             (E,)
+    layer_norm_1_scale         : Array   # (embed_dim,)                             (E,)
+
+    mlp_block_0_dense_0_bias   : Array   # (mlp_hidden_dim,)                        (M,)                     (4304,)        
+    mlp_block_0_dense_0_kernel : Array   # (embed_dim, mlp_hidden_dim)              (E,M)                    (1152, 4304)
+    mlp_block_0_dense_1_bias   : Array   # (embed_dim,)                             (E,)                     (1152,)
+    mlp_block_0_dense_1_kernel : Array   # (mlp_hidden_dim, embed_dim)              (M,E)                    (4304, 1152)
+    key_bias                   : Array   # (num_kv_heads, head_dim)                 (vN,vH)                  (16, 72)
+    key_kernel                 : Array   # (embed_dim, num_kv_heads, head_dim)      (E,vN,vH)                (1152, 16, 72)
+    out_bias                   : Array   # (embed_dim,)                             (E,)                     (1152,)
+    out_kernel                 : Array   # (num_heads, head_dim, embed_dim)         (vN,vH,E)                (16, 72, 1152)
+    query_bias                 : Array   # (num_heads, head_dim)                    (vN,vH)                  (16, 72)
+    query_kernel               : Array   # (embed_dim, num_heads, head_dim)         (E,vN,vH)                (1152, 16, 72)
+    value_bias                 : Array   # (num_heads, head_dim)                    (vN,vH)                  (16, 72)
+    value_kernel               : Array   # (embed_dim, num_heads, head_dim)         (E,vN,vH)                (1152, 16, 72)
+
+
+class Encoder(NamedTuple):
+    pos_embedding               : Array   # (1, max_seq_len, embed_dim)             (1,S,E)             
+    encoder_norm_scale          : Array   # (embed_dim,)                            (E,)
+    encoder_norm_bias           : Array   # (embed_dim,)                            (E,)
+    embedding_bias              : Array   # (embed_dim,)                            (E,)
+    embedding_kernel            : Array   # (patch_size, patch_size, in_channels, embed_dim)  (P,P,C,E)
+    # SigLiP encoder params
+    blocks                      : tuple[EncoderBlock, ...]
+
 class Layer(NamedTuple):
-    attn_key_norm_scale       : Array       # (head_dim,)                             (H,)
-    attn_query_norm_scale     : Array       # (head_dim,)                             (H,)
-    output_proj               : Array       # (num_heads, head_dim, embed_dim)        (N,H,D)
-    kv_proj                   : Array       # (2, num_kv_heads, embed_dim, head_dim)  (2,K,D,H)
-    q_proj                    : Array       # (num_heads, embed_dim, head_dim)        (N,D,H)
-    gating_weights            : Array       # (2, mlp_hidden_dim, embed_dim)          (2,F,D)
-    output_weights            : Array       # (mlp_hidden_dim, embed_dim)             (F,D)
-    post_attention_norm_scale : Array       # (embed_dim,)                            (D,)
-    post_ffw_norm_scale       : Array       # (embed_dim,)                            (D,)
-    pre_attention_norm_scale  : Array       # (embed_dim,)                            (D,)
-    pre_ffw_norm_scale        : Array       # (embed_dim,)                            (D,)
+    attn_key_norm_scale         : Array    # (head_dim,)                             (H,)
+    attn_query_norm_scale       : Array    # (head_dim,)                             (H,)
+    output_proj                 : Array    # (num_heads, head_dim, embed_dim)        (N,H,D)
+    kv_proj                     : Array    # (2, num_kv_heads, embed_dim, head_dim)  (2,K,D,H)
+    q_proj                      : Array    # (num_heads, embed_dim, head_dim)        (N,D,H)
+    gating_weights              : Array    # (2, mlp_hidden_dim, embed_dim)          (2,F,D)
+    output_weights              : Array    # (mlp_hidden_dim, embed_dim)             (F,D)
+    post_attention_norm_scale   : Array    # (embed_dim,)                            (D,)
+    post_ffw_norm_scale         : Array    # (embed_dim,)                            (D,)
+    pre_attention_norm_scale    : Array    # (embed_dim,)                            (D,)
+    pre_ffw_norm_scale          : Array    # (embed_dim,)                            (D,)
 
 
 class Gemma3(NamedTuple):
-    input_embedding_table     : Array       # (vocab_size, embed_dim)                 (V,D)
-    mm_input_projection       : Array       # (embed_dim, embed_dim)                  (ViT_embed_dim, D)
-    mm_soft_embedding_norm    : Array       # (embed_dim,)                            (ViT_embed_dim,)
-    final_norm_scale           : Array       # (embed_dim,)                            (D,)
-    blocks                    : tuple[Layer, ...]
- 
+    input_embedding_table       : Array     # (vocab_size, embed_dim)                 (V,D)
+    mm_input_projection         : Array     # (embed_dim, embed_dim)                  (ViT_embed_dim, D)
+    mm_soft_embedding_norm      : Array     # (embed_dim,)                            (ViT_embed_dim,)
+    final_norm_scale             : Array     # (embed_dim,)                            (D,)
+    blocks                      : tuple[Layer, ...]
+
+
+class Gemma3MultiModal(NamedTuple):
+    input_embedding_table       : Array    # (vocab_size, embed_dim)                  (V,D)
+    mm_input_projection         : Array    # (embed_dim, embed_dim)                   (D,D)
+    mm_soft_embedding_norm      : Array    # (embed_dim,)                             (D,)
+    final_norm_scale             : Array    # (embed_dim,)                             (D,)
+    blocks                      : tuple[Layer, ...]
+    encoder                     : Encoder
+# fmt: off
+
 
 def apply_rope(
     inputs: Array,
